@@ -1,0 +1,251 @@
+sargo SDHCI: keep writes in a RAM overlay instead of dropping them
+
+Patch 0082 absorbed every write without storing it. HFS later re-read
+blocks it had written after its buffer cache evicted them and got the old
+userdata contents: first boot of the 20H392 root panicked ~36 min in with
+"hfs_UNswap_BTNode: invalid forward link (0xFBF40026)" (pid 194
+itunescloudd). Writes now go to an in-memory overlay of 4 KiB pages
+(sector-granular valid bits) and reads prefer it. The eMMC is still never
+written; changes are lost at reboot. Cap: sargo_ovmb=<MiB>, default 256.
+Raw-device writes take the same path through physio.
+
+--- a/bsd/dev/sargo_sdhci.c
++++ b/bsd/dev/sargo_sdhci.c
+@@ -32,6 +32,7 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/kalloc.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+@@ -150,6 +151,105 @@
+ static LCK_GRP_DECLARE(sargo_sdhci_grp, "sargo_sdhci");
+ static LCK_MTX_DECLARE(sargo_sdhci_lock, &sargo_sdhci_grp);
+ 
++/*
++ * RAM write overlay. The driver cannot write the eMMC yet, and absorbing
++ * writes made HFS read back stale blocks after its buffer cache evicted
++ * them (2026-11-10 boot: "hfs_UNswap_BTNode: invalid forward link" in
++ * itunescloudd ~36 min in - a catalog node it had written came back as the
++ * old, never-flashed contents of userdata). Every write now lands here, in
++ * 4 KiB pages keyed by partition-relative page index, and reads prefer it.
++ * Nothing is written to the eMMC; changes last until the next boot.
++ * Size cap: sargo_ovmb=<MiB> (default SARGO_OV_DEFAULT_MB).
++ * All overlay state is protected by sargo_sdhci_lock.
++ */
++#define SARGO_OV_PAGE           4096u
++#define SARGO_OV_SECTORS        (SARGO_OV_PAGE / SDHCI_BLOCK)
++#define SARGO_OV_BUCKETS        (1u << 16)
++#define SARGO_OV_DEFAULT_MB     256u
++
++struct sargo_ov_ent {
++	struct sargo_ov_ent *next;
++	uint64_t page;                  /* partition-relative 4 KiB page index */
++	uint8_t *data;                  /* SARGO_OV_PAGE bytes */
++	uint8_t valid;                  /* bit n: sector n holds written data */
++};
++
++static struct sargo_ov_ent *sargo_ov_hash[SARGO_OV_BUCKETS];
++static uint64_t sargo_ov_bytes;         /* page data held */
++static uint64_t sargo_ov_limit;         /* cap on sargo_ov_bytes */
++static bool sargo_ov_full_logged;
++
++static inline uint32_t
++sargo_ov_bucket(uint64_t page)
++{
++	return (uint32_t)((page * 0x9E3779B97F4A7C15ull) >> 48) & (SARGO_OV_BUCKETS - 1);
++}
++
++static struct sargo_ov_ent *
++sargo_ov_find(uint64_t page)
++{
++	struct sargo_ov_ent *e;
++	for (e = sargo_ov_hash[sargo_ov_bucket(page)]; e != NULL; e = e->next) {
++		if (e->page == page) {
++			return e;
++		}
++	}
++	return NULL;
++}
++
++/* Find or create the overlay page; NULL when the cap or memory runs out. */
++static struct sargo_ov_ent *
++sargo_ov_get(uint64_t page)
++{
++	struct sargo_ov_ent *e = sargo_ov_find(page);
++	uint32_t b;
++
++	if (e != NULL) {
++		return e;
++	}
++	if (sargo_ov_bytes + SARGO_OV_PAGE > sargo_ov_limit) {
++		if (!sargo_ov_full_logged) {
++			sargo_ov_full_logged = true;
++			printf("SARGO SDHCI: RAM write overlay full (%llu MB, sargo_ovmb); writes now fail\n",
++			    sargo_ov_limit >> 20);
++		}
++		return NULL;
++	}
++	e = kalloc_type(struct sargo_ov_ent, Z_WAITOK | Z_ZERO);
++	if (e == NULL) {
++		return NULL;
++	}
++	e->data = kalloc_data(SARGO_OV_PAGE, Z_WAITOK | Z_ZERO);
++	if (e->data == NULL) {
++		kfree_type(struct sargo_ov_ent, e);
++		return NULL;
++	}
++	e->page = page;
++	b = sargo_ov_bucket(page);
++	e->next = sargo_ov_hash[b];
++	sargo_ov_hash[b] = e;
++	sargo_ov_bytes += SARGO_OV_PAGE;
++	if ((sargo_ov_bytes >> 20) != ((sargo_ov_bytes - SARGO_OV_PAGE) >> 20) &&
++	    ((sargo_ov_bytes >> 20) % 5) == 0) {
++		printf("SARGO SDHCI: %llu MB of writes held in RAM (not saved to eMMC)\n",
++		    sargo_ov_bytes >> 20);
++	}
++	return e;
++}
++
++/* Overlay copy of partition-relative sector lba, or NULL to read the eMMC. */
++static const uint8_t *
++sargo_ov_sector(uint64_t lba)
++{
++	struct sargo_ov_ent *e = sargo_ov_find(lba / SARGO_OV_SECTORS);
++	uint32_t s = (uint32_t)(lba % SARGO_OV_SECTORS);
++
++	if (e == NULL || !(e->valid & (1u << s))) {
++		return NULL;
++	}
++	return e->data + s * SDHCI_BLOCK;
++}
++
+ static inline uint8_t
+ sdhci_rd8(uint32_t off)
+ {
+@@ -825,20 +925,10 @@
+ 	uint64_t off = (uint64_t)buf_blkno(bp) * ss.secsize;
+ 	uint32_t count = buf_count(bp);
+ 	uint64_t part_bytes = ss.nblocks * SDHCI_BLOCK;
++
++	bool is_write = !(buf_flags(bp) & B_READ);
+ 
+ 	buf_setresid(bp, count);
+-	if (!(buf_flags(bp) & B_READ)) {
+-		/*
+-		 * Absorb write requests without error. Early launchd and
+-		 * mount -u / remount the root filesystem and flush dirty
+-		 * buffers; returning EROFS here causes launchd to panic
+-		 * ("launchd panic mount[3] exited"). Pretend the write
+-		 * succeeded with zero residual bytes.
+-		 */
+-		buf_setresid(bp, 0);
+-		buf_biodone(bp);
+-		return;
+-	}
+ 	if (off > part_bytes || count > part_bytes - off) {
+ 		error = EINVAL;
+ 		goto done;
+@@ -852,16 +942,58 @@
+ 	}
+ 
+ 	lck_mtx_lock(&sargo_sdhci_lock);
++	if (is_write) {
++		/*
++		 * Writes go to the RAM overlay (see sargo_ov_get), never to
++		 * the eMMC. Early launchd remounts the root read-write and
++		 * flushes, so they must succeed; they used to be dropped.
++		 */
++		for (uint32_t done = 0; done < count;) {
++			uint64_t pos = off + done;
++			uint64_t lba = pos / SDHCI_BLOCK;
++			uint32_t skip = (uint32_t)(pos % SDHCI_BLOCK);
++			uint32_t want = MIN(count - done, SDHCI_BLOCK - skip);
++			uint32_t s = (uint32_t)(lba % SARGO_OV_SECTORS);
++			struct sargo_ov_ent *e = sargo_ov_get(lba / SARGO_OV_SECTORS);
++			uint8_t *sec;
++
++			if (e == NULL) {
++				error = ENOSPC;
++				break;
++			}
++			sec = e->data + s * SDHCI_BLOCK;
++			if (!(e->valid & (1u << s)) && want != SDHCI_BLOCK) {
++				/* Partial sector: start from the eMMC contents. */
++				error = sdhci_read_block(ss.first_block + lba);
++				if (error) {
++					break;
++				}
++				memcpy(sec, (const uint8_t *)ss.bounce, SDHCI_BLOCK);
++			}
++			memcpy(sec + skip, vaddr + done, want);
++			e->valid |= (uint8_t)(1u << s);
++			done += want;
++			buf_setresid(bp, count - done);
++		}
++		lck_mtx_unlock(&sargo_sdhci_lock);
++		buf_unmap(bp);
++		goto done;
++	}
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / SDHCI_BLOCK;
+ 		uint32_t skip = (uint32_t)(pos % SDHCI_BLOCK);
+ 		uint32_t want = MIN(count - done, SDHCI_BLOCK - skip);
+-		error = sdhci_read_block(ss.first_block + lba);
+-		if (error) {
+-			break;
++		const uint8_t *ov = sargo_ov_sector(lba);
++		if (ov != NULL) {
++			memcpy(vaddr + done, ov + skip, want);
++		} else {
++			error = sdhci_read_block(ss.first_block + lba);
++			if (error) {
++				break;
++			}
++			memcpy(vaddr + done, (const uint8_t *)ss.bounce + skip, want);
+ 		}
+-		memcpy(vaddr + done, (const uint8_t *)ss.bounce + skip, want);
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
+@@ -955,10 +1087,10 @@
+ }
+ 
+ static int
+-sargo_sdhci_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++sargo_sdhci_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	uio_setresid(uio, 0);
+-	return 0;
++	/* Raw writes take the same path as block writes: into the RAM overlay. */
++	return physio(sargo_sdhci_strategy, NULL, dev, B_WRITE, minphys, uio, (int)ss.secsize);
+ }
+ 
+ static const struct bdevsw sargo_sdhci_bdevsw = {
+@@ -1002,9 +1134,12 @@
+ sargo_sdhci_init(void)
+ {
+ 	char want[64] = "userdata";
++	uint32_t ovmb = SARGO_OV_DEFAULT_MB;
+ 	int error;
+ 
+ 	PE_parse_boot_argn("sdhciroot", want, sizeof(want));
++	PE_parse_boot_argn("sargo_ovmb", &ovmb, sizeof(ovmb));
++	sargo_ov_limit = (uint64_t)ovmb << 20;
+ 
+ 	ss.regs = ml_io_map(SARGO_SDHCI_BASE, SARGO_SDHCI_SIZE);
+ 	ss.cq_regs = ml_io_map(SARGO_CQHCI_BASE, SARGO_CQHCI_SIZE);
+@@ -1035,8 +1170,8 @@
+ 	devfs_make_node(ss.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(ss.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+ 	ss.ready = true;
+-	printf("SARGO SDHCI: \"%s\": first block 0x%llx, %llu MiB, read-only\n",
+-	    want, ss.first_block, ss.nblocks * SDHCI_BLOCK >> 20);
++	printf("SARGO SDHCI: \"%s\": first block 0x%llx, %llu MiB, eMMC read-only, writes kept in RAM (up to %u MB)\n",
++	    want, ss.first_block, ss.nblocks * SDHCI_BLOCK >> 20, ovmb);
+ 	sweet_sample_start();
+ 	return 0;
+ }

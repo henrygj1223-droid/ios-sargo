@@ -1,0 +1,499 @@
+sargo SDHCI: multi-block reads, 8-bit bus and 52 MHz, each verified
+
+Reads were one 512-byte CMD17 per command on a 1-bit bus at 25 MHz, with
+a DAT reset each time; the first boot needed ~30 min to reach the Apple
+logo. After the partition lookup, sargo_speed_up() takes a reference copy
+of LBA 0..63 the old way, then enables CMD18 + Auto CMD12 reads of up to
+128 KiB through a page-wise ADMA2 table, an 8-bit (else 4-bit) bus and
+52 MHz high-speed timing. Each step re-reads LBA 0..63 and is undone if
+the data differs. A read error later drops back to 1-bit 25 MHz, and
+three more to single-block reads. RAM-overlay sectors (0086) still win
+over eMMC data. Boot-args: sargo_mb=0, sargo_bus=1|4|8, sargo_hs=0.
+
+--- a/bsd/dev/sargo_sdhci.c
++++ b/bsd/dev/sargo_sdhci.c
+@@ -88,6 +88,10 @@
+ };
+ 
+ static struct sdhci_adma2_desc64 ss_adma[2] __attribute__((aligned(64)));
++
++/* Host control byte for data commands: 64-bit ADMA2 (0x18) plus the bus
++ * width and high-speed bits chosen by sargo_speed_up(). */
++static uint8_t sargo_hostctl = 0x18;
+ #define REG_CORE_DLL_CONFIG      0x200
+ #define REG_CORE_VENDOR_SPEC     0x20c
+ #define REG_CORE_MCI_FIFO_CNT    0x308
+@@ -430,8 +434,8 @@
+ 		sdhci_set_reset(0x00);
+ 		sdhci_wr32(REG_BLOCK_SIZE, (1u << 16) | SDHCI_BLOCK);
+ 
+-		/* Configure 64-bit ADMA2 in REG_HOST_CONTROL (0x18: 1-bit bus, 64-bit ADMA2) */
+-		sdhci_set_host_pwr(0x18, 0x0f);
++		/* 64-bit ADMA2 in REG_HOST_CONTROL (0x18) with the current bus width/speed bits */
++		sdhci_set_host_pwr(sargo_hostctl, 0x0f);
+ 
+ 		/* Populate 64-bit ADMA2 descriptor table */
+ 		uint64_t bounce_phys = (uint64_t)kvtophys((vm_offset_t)ss.bounce);
+@@ -577,8 +581,425 @@
+ 	}
+ 	return sdhci_cmd(17, (uint32_t)lba,
+ 	    CMD_RESP_SHORT | CMD_FLAG_CRC | CMD_FLAG_INDEX | CMD_FLAG_DATA, 1, resp);
++}
++
++/*
++ * Faster reads (patch 0087). sdhci_read_block() moves one 512-byte block
++ * per command over a 1-bit bus at 25 MHz, with a DAT reset each time: the
++ * first boot took ~30 min to reach the Apple logo. sdhci_read_multi() reads
++ * up to SARGO_MB_MAX_BLOCKS with one CMD18 (Auto CMD12) through a page-wise
++ * ADMA2 table, and sargo_speed_up() moves the card to an 8-bit (else 4-bit)
++ * bus and 52 MHz high-speed timing. Each step is checked against LBA
++ * 0..SARGO_REF_BLOCKS-1 read the old way first, and undone if the data
++ * differs. A read error later drops back to 1-bit 25 MHz, and repeated
++ * errors there to single-block reads.
++ * Boot-args: sargo_mb=0 (none of this), sargo_bus=1|4|8, sargo_hs=0.
++ */
++#define SARGO_MB_MAX_BLOCKS     256u                    /* 128 KiB = DKIOCGETMAXBLOCKCOUNTREAD */
++#define SARGO_MB_BYTES          (SARGO_MB_MAX_BLOCKS * SDHCI_BLOCK)
++#define SARGO_MB_CHUNK          4096u                   /* bytes per ADMA2 descriptor */
++#define SARGO_MB_NDESC          (SARGO_MB_BYTES / SARGO_MB_CHUNK)
++#define SARGO_REF_BLOCKS        64u                     /* LBA 0..63: MBR, GPT header, GPT entries */
++#define EXT_CSD_BUS_WIDTH       183
++#define EXT_CSD_HS_TIMING       185
++#define HOSTCTL_4BIT            0x02u
++#define HOSTCTL_HISPD           0x04u
++#define HOSTCTL_8BIT            0x20u
++#define PRES_DAT0               (1u << 20)
++#define R1_SWITCH_ERROR         (1u << 7)
++
++static uint8_t sargo_mb_buf[SARGO_MB_BYTES] __attribute__((aligned(16384)));
++static uint8_t sargo_ref_buf[SARGO_REF_BLOCKS * SDHCI_BLOCK] __attribute__((aligned(64)));
++/* 33 x 12 bytes in one 512-byte-aligned block: never crosses a page. */
++static struct sdhci_adma2_desc64 sargo_mb_desc[SARGO_MB_NDESC + 1] __attribute__((aligned(512)));
++static bool sargo_mb_on;                /* multi-block reads in use */
++static bool sargo_fast;                 /* bus width or clock above 1-bit 25 MHz */
++static uint32_t sargo_bus_width = 1;
++static uint32_t sargo_mb_errors;
++
++static int
++sdhci_wait_dat0(void)
++{
++	uint64_t deadline;
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (!(sdhci_rd32(REG_PRESENT_STATE) & PRES_DAT0)) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(10);
++	}
++	return 0;
++}
++
++static void
++sargo_mb_flush(uint32_t bytes)
++{
++	for (uint32_t off = 0; off < bytes; off += SARGO_MB_CHUNK) {
++		uint64_t p = (uint64_t)kvtophys((vm_offset_t)(sargo_mb_buf + off));
++		flush_dcache64(p, MIN(SARGO_MB_CHUNK, bytes - off), TRUE);
++	}
++}
++
++/* CMD18 + Auto CMD12: read n (1..SARGO_MB_MAX_BLOCKS) blocks at device lba into sargo_mb_buf. */
++static int
++sdhci_read_multi(uint64_t lba, uint32_t n)
++{
++	uint64_t deadline, desc_phys;
++	uint32_t bytes = n * SDHCI_BLOCK;
++	uint32_t nd = (bytes + SARGO_MB_CHUNK - 1) / SARGO_MB_CHUNK;
++	uint16_t nint = 0, eint = 0;
++	int error = 0;
++
++	if (n == 0 || n > SARGO_MB_MAX_BLOCKS || lba + n - 1 > UINT32_MAX) {
++		return EINVAL;
++	}
++	ss.data_fail = NULL;
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (sdhci_rd32(REG_PRESENT_STATE) & 0x3u) {
++		if (mach_absolute_time() > deadline) {
++			printf("SARGO SDHCI: CMD18: command/data line busy (pres 0x%08x)\n",
++			    sdhci_rd32(REG_PRESENT_STATE));
++			sdhci_reset_cmd_data();
++			return EBUSY;
++		}
++		delay(10);
++	}
++
++	/* Same DAT reset and atomic 32-bit register writes as sdhci_cmd(). */
++	sdhci_set_reset(0x04);
++	nanoseconds_to_absolutetime(100000000ULL, &deadline);
++	deadline += mach_absolute_time();
++	while (sdhci_get_reset() & 0x04) {
++		if (mach_absolute_time() > deadline) {
++			break;
++		}
++		delay(10);
++	}
++	sdhci_set_reset(0x00);
++	sdhci_wr32(REG_BLOCK_SIZE, (n << 16) | SDHCI_BLOCK);
++	sdhci_set_host_pwr(sargo_hostctl, 0x0f);
++
++	for (uint32_t i = 0; i < nd; i++) {
++		uint32_t len = MIN(SARGO_MB_CHUNK, bytes - i * SARGO_MB_CHUNK);
++		uint64_t p = (uint64_t)kvtophys((vm_offset_t)(sargo_mb_buf + i * SARGO_MB_CHUNK));
++		sargo_mb_desc[i].cmd = (i == nd - 1) ? 0x0023u : 0x0021u;      /* TRAN|VALID (+END) */
++		sargo_mb_desc[i].len = (uint16_t)len;
++		sargo_mb_desc[i].addr_lo = (uint32_t)(p & 0xffffffffu);
++		sargo_mb_desc[i].addr_hi = (uint32_t)(p >> 32);
++	}
++	sargo_mb_desc[nd].cmd = 0x0003u;        /* NOP|END|VALID, as sdhci_cmd() does */
++	sargo_mb_desc[nd].len = 0;
++	sargo_mb_desc[nd].addr_lo = 0;
++	sargo_mb_desc[nd].addr_hi = 0;
++	sargo_mb_flush(bytes);
++	desc_phys = (uint64_t)kvtophys((vm_offset_t)sargo_mb_desc);
++	flush_dcache64(desc_phys, sizeof(sargo_mb_desc), TRUE);
++	sdhci_wr32(REG_ADMA_ADDR_LO, (uint32_t)(desc_phys & 0xffffffffu));
++	sdhci_wr32(REG_ADMA_ADDR_HI, (uint32_t)(desc_phys >> 32));
++
++	sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
++	sdhci_wr32(REG_ARGUMENT, (uint32_t)lba);
++	/* Transfer Mode 0x0037: DMA, block count enable, Auto CMD12, read, multi-block. */
++	sdhci_wr32(REG_TRANSFER_MODE,
++	    ((((uint32_t)18 << 8) | CMD_RESP_SHORT | CMD_FLAG_CRC | CMD_FLAG_INDEX | CMD_FLAG_DATA) << 16) |
++	    0x0037u);
++	__builtin_arm_dsb(0xf);
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t st = sdhci_rd32(REG_INT_STATUS);
++		nint = (uint16_t)(st & 0xffff);
++		eint = (uint16_t)(st >> 16);
++		if (nint & INT_CMD_COMPLETE) {
++			break;
++		}
++		if (eint || (nint & INT_ERROR)) {
++			error = (eint & EINT_CMD_TIMEOUT) ? ETIMEDOUT : EIO;
++			ss.data_fail = "cmd18-cmd";
++			goto out;
++		}
++		if (mach_absolute_time() > deadline) {
++			error = ETIMEDOUT;
++			ss.data_fail = "cmd18-cmd-timeout";
++			goto out;
++		}
++		delay(10);
++	}
++	if (sdhci_rd32(REG_RESPONSE0) & 0xfff80000u) {
++		error = EIO;
++		ss.data_fail = "cmd18-status";
++		goto out;
++	}
++	sdhci_wr32(REG_INT_STATUS, INT_CMD_COMPLETE);
++
++	/* 1 s plus 10 ms per block: enough even at the 400 kHz fallback clock. */
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS + (uint64_t)n * 10000000ull, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t st = sdhci_rd32(REG_INT_STATUS);
++		nint = (uint16_t)(st & 0xffff);
++		eint = (uint16_t)(st >> 16);
++		if (eint || (nint & INT_ERROR)) {       /* includes Auto CMD12 errors */
++			error = (eint & EINT_DATA_TIMEOUT) ? ETIMEDOUT : EIO;
++			ss.data_fail = "cmd18-data";
++			goto out;
++		}
++		if (nint & INT_XFER_COMPLETE) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			error = ETIMEDOUT;
++			ss.data_fail = "cmd18-xfer-timeout";
++			goto out;
++		}
++		delay(10);
++	}
++	sargo_mb_flush(bytes);                  /* drop lines the CPU may have prefetched */
++	__builtin_arm_dsb(0xf);
++out:
++	ss.last_nint = nint;
++	ss.last_eint = eint;
++	if (error) {
++		uint32_t resp[4];
++		printf("SARGO SDHCI: CMD18 lba 0x%llx n %u failed (%s, nint 0x%04x eint 0x%04x adma_err 0x%08x)\n",
++		    lba, n, ss.data_fail, nint, eint, sdhci_rd32(REG_ADMA_ERROR));
++		sdhci_reset_cmd_data();
++		sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
++		/* Back to TRAN if Auto CMD12 never ran (an error status here is fine). */
++		(void)sdhci_cmd(12, 0, CMD_RESP_SHORT_BUSY | CMD_FLAG_CRC | CMD_FLAG_INDEX, 0, resp);
++		(void)sdhci_wait_dat0();
++	}
++	sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
++	return error;
++}
++
++/* CMD6 SWITCH one EXT_CSD byte, wait out busy, then CMD13 for SWITCH_ERROR. */
++static int
++sdhci_switch(uint32_t index, uint32_t value)
++{
++	uint32_t resp[4];
++	int error;
++
++	error = sdhci_cmd(6, (0x03u << 24) | (index << 16) | (value << 8),
++	    CMD_RESP_SHORT_BUSY | CMD_FLAG_CRC | CMD_FLAG_INDEX, 0, resp);
++	if (error) {
++		return error;
++	}
++	delay(5000);
++	(void)sdhci_wait_dat0();
++	error = sdhci_cmd(13, (uint32_t)ss.rca << 16,
++	    CMD_RESP_SHORT | CMD_FLAG_CRC | CMD_FLAG_INDEX, 0, resp);
++	if (error) {
++		return error;
++	}
++	if (resp[0] & R1_SWITCH_ERROR) {
++		printf("SARGO SDHCI: CMD6 EXT_CSD[%u]=%u: switch error (status 0x%08x)\n",
++		    index, value, resp[0]);
++		return EIO;
++	}
++	return 0;
+ }
+ 
++/* Re-read LBA 0..SARGO_REF_BLOCKS-1 with CMD18; it must match the safe-mode copy. */
++static int
++sargo_verify(const char *what)
++{
++	int error = sdhci_read_multi(0, SARGO_REF_BLOCKS);
++
++	if (!error && memcmp(sargo_mb_buf, sargo_ref_buf, sizeof(sargo_ref_buf)) != 0) {
++		error = EIO;
++	}
++	printf("SARGO SDHCI: %s: %s\n", what, error ? "FAILED, undone" : "verified");
++	return error;
++}
++
++static void
++sargo_set_hostctl(uint8_t v)
++{
++	sargo_hostctl = v;
++	sdhci_set_host_pwr(sargo_hostctl, 0x0f);
++}
++
++/* Back to the mode the driver was brought up in: 1-bit bus, default timing, 25 MHz. */
++static void
++sargo_set_safe_mode(void)
++{
++	(void)sdhci_set_clock(25000000);
++	(void)sdhci_switch(EXT_CSD_HS_TIMING, 0);
++	(void)sdhci_switch(EXT_CSD_BUS_WIDTH, 0);
++	sargo_set_hostctl(0x18);
++	sargo_bus_width = 1;
++	sargo_fast = false;
++}
++
++static int
++sargo_try_width(uint32_t width)
++{
++	char what[16];
++	int error;
++
++	snprintf(what, sizeof(what), "%u-bit bus", width);
++	error = sdhci_switch(EXT_CSD_BUS_WIDTH, width == 8 ? 2 : 1);
++	if (!error) {
++		sargo_set_hostctl((uint8_t)((sargo_hostctl & ~(HOSTCTL_4BIT | HOSTCTL_8BIT)) |
++		    (width == 8 ? HOSTCTL_8BIT : HOSTCTL_4BIT)));
++		error = sargo_verify(what);
++	} else {
++		printf("SARGO SDHCI: %s: card refused\n", what);
++	}
++	if (error) {
++		(void)sdhci_switch(EXT_CSD_BUS_WIDTH, 0);
++		sargo_set_hostctl((uint8_t)(sargo_hostctl & ~(HOSTCTL_4BIT | HOSTCTL_8BIT)));
++		return error;
++	}
++	sargo_bus_width = width;
++	sargo_fast = true;
++	return 0;
++}
++
++static int
++sargo_try_hs(void)
++{
++	int error = sdhci_switch(EXT_CSD_HS_TIMING, 1);
++
++	if (!error) {
++		sargo_set_hostctl((uint8_t)(sargo_hostctl | HOSTCTL_HISPD));
++		error = sdhci_set_clock(50000000);
++		if (!error) {
++			error = sargo_verify("52 MHz high-speed timing");
++		}
++	} else {
++		printf("SARGO SDHCI: high-speed timing: card refused\n");
++	}
++	if (error) {
++		(void)sdhci_set_clock(25000000);
++		(void)sdhci_switch(EXT_CSD_HS_TIMING, 0);
++		sargo_set_hostctl((uint8_t)(sargo_hostctl & ~HOSTCTL_HISPD));
++		return error;
++	}
++	sargo_fast = true;
++	return 0;
++}
++
++/* Called once at init, with the card in TRAN at 1-bit 25 MHz and the lock held. */
++static void
++sargo_speed_up(void)
++{
++	uint32_t mb = 1, bus = 8, hs = 1;
++	uint64_t t0, ns;
++
++	PE_parse_boot_argn("sargo_mb", &mb, sizeof(mb));
++	PE_parse_boot_argn("sargo_bus", &bus, sizeof(bus));
++	PE_parse_boot_argn("sargo_hs", &hs, sizeof(hs));
++	if (!mb) {
++		printf("SARGO SDHCI: fast reads off (sargo_mb=0)\n");
++		return;
++	}
++
++	/* Reference copy, read the proven way: CMD17, 1-bit, 25 MHz. */
++	for (uint32_t i = 0; i < SARGO_REF_BLOCKS; i++) {
++		if (sdhci_read_block(i)) {
++			printf("SARGO SDHCI: reference read of LBA %u failed; staying on single-block reads\n", i);
++			return;
++		}
++		memcpy(sargo_ref_buf + i * SDHCI_BLOCK, ss.bounce, SDHCI_BLOCK);
++	}
++	if (sargo_verify("multi-block reads (CMD18)")) {
++		return;
++	}
++	sargo_mb_on = true;
++
++	if (bus == 8 && sargo_try_width(8) != 0) {
++		bus = 4;
++	}
++	if (bus == 4) {
++		(void)sargo_try_width(4);
++	}
++	if (hs) {
++		(void)sargo_try_hs();
++	}
++
++	t0 = mach_absolute_time();
++	if (sdhci_read_multi(0, SARGO_MB_MAX_BLOCKS) == 0) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		printf("SARGO SDHCI: fast reads on: %u-bit bus, %s, 128 KiB in %llu us (%llu KB/s)\n",
++		    sargo_bus_width, (sargo_hostctl & HOSTCTL_HISPD) ? "52 MHz" : "25 MHz",
++		    ns / 1000, ns ? (uint64_t)SARGO_MB_BYTES * 1000000ull / ns : 0);
++	}
++}
++
++/* A multi-block read failed: fall back to 1-bit 25 MHz, then to CMD17. */
++static void
++sargo_degrade(void)
++{
++	sargo_mb_errors++;
++	if (sargo_fast) {
++		printf("SARGO SDHCI: read error in fast mode; back to 1-bit 25 MHz\n");
++		sargo_set_safe_mode();
++	} else if (sargo_mb_errors >= 3) {
++		printf("SARGO SDHCI: repeated multi-block errors; back to single-block reads\n");
++		sargo_mb_on = false;
++	}
++}
++
++/*
++ * Read count bytes at partition byte offset off into dst. Sectors held in
++ * the RAM write overlay win over the eMMC. Lock held.
++ */
++static int
++sargo_read_range(uint64_t off, uint32_t count, uint8_t *dst)
++{
++	uint32_t done = 0;
++	int error;
++
++	while (done < count) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / SDHCI_BLOCK;
++		uint32_t skip = (uint32_t)(pos % SDHCI_BLOCK);
++		uint32_t left = count - done;
++		uint32_t n, got;
++
++		if (!sargo_mb_on) {
++			/* The original path: one CMD17 per sector. */
++			const uint8_t *ov = sargo_ov_sector(lba);
++			got = MIN(left, SDHCI_BLOCK - skip);
++			if (ov != NULL) {
++				memcpy(dst + done, ov + skip, got);
++			} else {
++				error = sdhci_read_block(ss.first_block + lba);
++				if (error) {
++					return error;
++				}
++				memcpy(dst + done, (const uint8_t *)ss.bounce + skip, got);
++			}
++			done += got;
++			continue;
++		}
++
++		n = MIN((skip + left + SDHCI_BLOCK - 1) / SDHCI_BLOCK, SARGO_MB_MAX_BLOCKS);
++		error = sdhci_read_multi(ss.first_block + lba, n);
++		if (error) {
++			sargo_degrade();        /* then retry this chunk, slower */
++			continue;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			const uint8_t *ov = sargo_ov_sector(lba + i);
++			if (ov != NULL) {
++				memcpy(sargo_mb_buf + i * SDHCI_BLOCK, ov, SDHCI_BLOCK);
++			}
++		}
++		got = MIN(left, n * SDHCI_BLOCK - skip);
++		memcpy(dst + done, sargo_mb_buf + skip, got);
++		done += got;
++	}
++	return 0;
++}
++
+ /* Standard eMMC init: CMD0 -> CMD1 -> CMD2 -> CMD3 -> CMD9 -> CMD7 -> CMD16. */
+ static int
+ sdhci_init_card(void)
+@@ -979,23 +1400,9 @@
+ 		buf_unmap(bp);
+ 		goto done;
+ 	}
+-	for (uint32_t done = 0; done < count;) {
+-		uint64_t pos = off + done;
+-		uint64_t lba = pos / SDHCI_BLOCK;
+-		uint32_t skip = (uint32_t)(pos % SDHCI_BLOCK);
+-		uint32_t want = MIN(count - done, SDHCI_BLOCK - skip);
+-		const uint8_t *ov = sargo_ov_sector(lba);
+-		if (ov != NULL) {
+-			memcpy(vaddr + done, ov + skip, want);
+-		} else {
+-			error = sdhci_read_block(ss.first_block + lba);
+-			if (error) {
+-				break;
+-			}
+-			memcpy(vaddr + done, (const uint8_t *)ss.bounce + skip, want);
+-		}
+-		done += want;
+-		buf_setresid(bp, count - done);
++	error = sargo_read_range(off, count, (uint8_t *)vaddr);
++	if (!error) {
++		buf_setresid(bp, 0);
+ 	}
+ 	if (!error) {
+ 		static uint64_t sargo_total_bytes_read = 0;
+@@ -1151,6 +1558,9 @@
+ 		ss.fail = "GPT";
+ 		error = sdhci_find_partition(want);
+ 	}
++	if (!error) {
++		sargo_speed_up();
++	}
+ 	lck_mtx_unlock(&sargo_sdhci_lock);
+ 	if (error) {
+ 		return error;

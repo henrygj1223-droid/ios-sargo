@@ -1,0 +1,35 @@
+sargo: start the sweet USB device + live console log
+
+sweet_usb_probe() (patches 0072-0077, 0081) is only called from the sweet
+UFS root init, which sargo does not run, so sweetusb=2 did nothing on the
+Pixel 3a. Call it at the end of sargo_sdhci_init(), after the sampler.
+sargo's USB block matches sweet's addresses (live FDT ssusb@a600000,
+dwc3@a600000, qusb@88e2000; QSCRATCH 0xa6f8800). Without sweetusb=2 it
+only prints the read-only probe, as on sweet.
+
+--- a/bsd/dev/sargo_sdhci.c
++++ b/bsd/dev/sargo_sdhci.c
+@@ -46,6 +46,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern addr64_t kvtophys(vm_offset_t va);
+ extern void sweet_sample_start(void);
++extern void sweet_usb_probe(void);       /* bsd/dev/sweet_usb.c */
+ 
+ /* SDHCI standard register offsets (SD Host Controller spec). */
+ #define REG_DMA_ADDR        0x00
+@@ -1583,6 +1584,15 @@
+ 	printf("SARGO SDHCI: \"%s\": first block 0x%llx, %llu MiB, eMMC read-only, writes kept in RAM (up to %u MB)\n",
+ 	    want, ss.first_block, ss.nblocks * SDHCI_BLOCK >> 20, ovmb);
+ 	sweet_sample_start();
++	/*
++	 * USB device mode + live console log (patches 0072-0077, 0081;
++	 * boot-arg sweetusb=2). sweet starts it from its UFS root init, which
++	 * sargo does not run. sargo's DWC3 (0x0a600000), QSCRATCH
++	 * (0x0a6f8800) and QUSB2 PHY (0x088e2000) sit at the same addresses
++	 * as on sweet (live FDT ssusb@a600000, qusb@88e2000), and ABL leaves
++	 * the controller powered and clocked for fastboot.
++	 */
++	sweet_usb_probe();
+ 	return 0;
+ }
+ 

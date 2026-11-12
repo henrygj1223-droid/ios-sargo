@@ -43,10 +43,10 @@ index 43cee47..e7727b1 100644
  		(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
  	}
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index a20a764..f322bb1 100644
+index a20a764..bcaa3e9 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -993,7 +993,14 @@ sweet_crash_strings(const char *name)
+@@ -993,7 +993,13 @@ sweet_crash_strings(const char *name)
  /*
   * SWEET process sampler (bsd/dev/sweet_sample.c): user pc/lr/sp and a frame
   * pointer backtrace of every thread of a task, from the saved user state.
@@ -55,13 +55,12 @@ index a20a764..f322bb1 100644
 + * header), block hint, and the kernel frame pointer backtrace (unslid;
 + * symbolicate against kernel.development.sweet).
   */
-+#include <kern/thread_kernel_state.h>
-+#include <mach/vm_param.h>
++#include <mach/vm_param.h>     /* thread_get_kernel_state() comes in via kern/thread.h */
 +
  void sweet_sample_task(const char *name, int pid, task_t task);
  
  void
-@@ -1009,7 +1016,8 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1009,7 +1015,8 @@ sweet_sample_task(const char *name, int pid, task_t task)
  		slide = sr->sr_slide;
  		vm_shared_region_deallocate(sr);
  	}
@@ -71,7 +70,7 @@ index a20a764..f322bb1 100644
  
  	task_lock(task);
  	queue_iterate(&task->threads, thread, thread_t, task_threads) {
-@@ -1036,6 +1044,34 @@ sweet_sample_task(const char *name, int pid, task_t task)
+@@ -1036,6 +1043,34 @@ sweet_sample_task(const char *name, int pid, task_t task)
  			fp = frame[0];
  		}
  		printf("%s\n", line);

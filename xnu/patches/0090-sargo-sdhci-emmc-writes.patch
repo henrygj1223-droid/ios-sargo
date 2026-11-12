@@ -1,0 +1,349 @@
+sargo SDHCI: real eMMC writes behind boot-arg sargo_rw=1
+
+With the RAM overlay (0086) nothing iOS writes survives a reboot, so every
+boot is a first boot: LaunchServices rebuilds its database each time and
+SpringBoard waits ~30 min for it on one CPU. sargo_rw=1 sends writes to the
+userdata partition: CMD24 for one block, CMD25 + Auto CMD12 for up to 128
+KiB, through the same ADMA2 bounce buffer as the CMD18 reads. A request
+completes only after Transfer Complete, DAT0 high and CMD13 back in TRAN
+with no R1 error bits, and init switches the eMMC cache off (EXT_CSD 33), so
+HFS journal ordering holds when power is cut. A partial sector is read and
+merged. A write error in fast mode drops to 1-bit 25 MHz and retries once.
+Without sargo_rw=1 nothing changes (RAM overlay). The sampler line shows
+"wrote N MB" in this mode.
+
+--- a/bsd/dev/sargo_sdhci.c
++++ b/bsd/dev/sargo_sdhci.c
+@@ -775,7 +775,201 @@
+ 		/* Back to TRAN if Auto CMD12 never ran (an error status here is fine). */
+ 		(void)sdhci_cmd(12, 0, CMD_RESP_SHORT_BUSY | CMD_FLAG_CRC | CMD_FLAG_INDEX, 0, resp);
+ 		(void)sdhci_wait_dat0();
++	}
++	sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
++	return error;
++}
++
++/*
++ * Real eMMC writes (patch 0090, boot-arg sargo_rw=1). Data goes from
++ * sargo_mb_buf to the card with CMD24 (one block) or CMD25 + Auto CMD12,
++ * through the same page-wise ADMA2 table as sdhci_read_multi(). The call
++ * returns only after the card has left its programming busy state and
++ * CMD13 reports no error, so a completed buf is on the flash (the cache is
++ * switched off at init): HFS journal ordering holds across power loss.
++ */
++#define SARGO_WR_BUSY_NS        (3ull * NSEC_PER_SEC)   /* programming busy limit */
++#define R1_ERROR_BITS           0xe4380000u             /* R1 errors Linux checks for data commands */
++#define R1_CURRENT_STATE(r)     (((r) >> 9) & 0xfu)
++#define R1_STATE_TRAN           4u
++#define EXT_CSD_CACHE_CTRL      33
++
++static bool sargo_rw;                   /* sargo_rw=1: writes go to the eMMC */
++static uint64_t sargo_wr_bytes;
++
++/* Wait (up to SARGO_WR_BUSY_NS) for DAT0 high and the card back in TRAN with no error bits. */
++static int
++sargo_wait_programmed(void)
++{
++	uint64_t deadline;
++	uint32_t resp[4];
++	int error;
++
++	nanoseconds_to_absolutetime(SARGO_WR_BUSY_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		if (sdhci_rd32(REG_PRESENT_STATE) & PRES_DAT0) {
++			error = sdhci_cmd(13, (uint32_t)ss.rca << 16,
++			    CMD_RESP_SHORT | CMD_FLAG_CRC | CMD_FLAG_INDEX, 0, resp);
++			if (error) {
++				return error;
++			}
++			if (resp[0] & R1_ERROR_BITS) {
++				printf("SARGO SDHCI: write: card status 0x%08x\n", resp[0]);
++				return EIO;
++			}
++			if (R1_CURRENT_STATE(resp[0]) == R1_STATE_TRAN) {
++				return 0;
++			}
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("SARGO SDHCI: write: card still programming after 3 s (pres 0x%08x)\n",
++			    sdhci_rd32(REG_PRESENT_STATE));
++			return ETIMEDOUT;
++		}
++		delay(50);
++	}
++}
++
++/* Write n (1..SARGO_MB_MAX_BLOCKS) blocks from sargo_mb_buf to device lba. */
++static int
++sdhci_write_multi(uint64_t lba, uint32_t n)
++{
++	uint64_t deadline, desc_phys;
++	uint32_t bytes = n * SDHCI_BLOCK;
++	uint32_t nd = (bytes + SARGO_MB_CHUNK - 1) / SARGO_MB_CHUNK;
++	uint16_t nint = 0, eint = 0;
++	uint8_t idx = (n == 1) ? 24 : 25;
++	int error = 0;
++
++	if (n == 0 || n > SARGO_MB_MAX_BLOCKS || lba + n - 1 > UINT32_MAX) {
++		return EINVAL;
++	}
++	ss.data_fail = NULL;
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (sdhci_rd32(REG_PRESENT_STATE) & 0x3u) {
++		if (mach_absolute_time() > deadline) {
++			printf("SARGO SDHCI: CMD%u: command/data line busy (pres 0x%08x)\n",
++			    idx, sdhci_rd32(REG_PRESENT_STATE));
++			sdhci_reset_cmd_data();
++			return EBUSY;
++		}
++		delay(10);
++	}
++
++	sdhci_set_reset(0x04);
++	nanoseconds_to_absolutetime(100000000ULL, &deadline);
++	deadline += mach_absolute_time();
++	while (sdhci_get_reset() & 0x04) {
++		if (mach_absolute_time() > deadline) {
++			break;
++		}
++		delay(10);
++	}
++	sdhci_set_reset(0x00);
++	sdhci_wr32(REG_BLOCK_SIZE, (n << 16) | SDHCI_BLOCK);
++	sdhci_set_host_pwr(sargo_hostctl, 0x0f);
++
++	for (uint32_t i = 0; i < nd; i++) {
++		uint32_t len = MIN(SARGO_MB_CHUNK, bytes - i * SARGO_MB_CHUNK);
++		uint64_t p = (uint64_t)kvtophys((vm_offset_t)(sargo_mb_buf + i * SARGO_MB_CHUNK));
++		sargo_mb_desc[i].cmd = (i == nd - 1) ? 0x0023u : 0x0021u;      /* TRAN|VALID (+END) */
++		sargo_mb_desc[i].len = (uint16_t)len;
++		sargo_mb_desc[i].addr_lo = (uint32_t)(p & 0xffffffffu);
++		sargo_mb_desc[i].addr_hi = (uint32_t)(p >> 32);
++	}
++	sargo_mb_desc[nd].cmd = 0x0003u;
++	sargo_mb_desc[nd].len = 0;
++	sargo_mb_desc[nd].addr_lo = 0;
++	sargo_mb_desc[nd].addr_hi = 0;
++	sargo_mb_flush(bytes);                  /* the CPU filled the buffer: clean it to RAM */
++	desc_phys = (uint64_t)kvtophys((vm_offset_t)sargo_mb_desc);
++	flush_dcache64(desc_phys, sizeof(sargo_mb_desc), TRUE);
++	sdhci_wr32(REG_ADMA_ADDR_LO, (uint32_t)(desc_phys & 0xffffffffu));
++	sdhci_wr32(REG_ADMA_ADDR_HI, (uint32_t)(desc_phys >> 32));
++
++	sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
++	sdhci_wr32(REG_ARGUMENT, (uint32_t)lba);
++	/* Transfer Mode: DMA, block count enable, write; CMD25 adds Auto CMD12 and multi-block. */
++	sdhci_wr32(REG_TRANSFER_MODE,
++	    ((((uint32_t)idx << 8) | CMD_RESP_SHORT | CMD_FLAG_CRC | CMD_FLAG_INDEX | CMD_FLAG_DATA) << 16) |
++	    (n == 1 ? 0x0003u : 0x0027u));
++	__builtin_arm_dsb(0xf);
++
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t st = sdhci_rd32(REG_INT_STATUS);
++		nint = (uint16_t)(st & 0xffff);
++		eint = (uint16_t)(st >> 16);
++		if (nint & INT_CMD_COMPLETE) {
++			break;
++		}
++		if (eint || (nint & INT_ERROR)) {
++			error = (eint & EINT_CMD_TIMEOUT) ? ETIMEDOUT : EIO;
++			ss.data_fail = "write-cmd";
++			goto out;
++		}
++		if (mach_absolute_time() > deadline) {
++			error = ETIMEDOUT;
++			ss.data_fail = "write-cmd-timeout";
++			goto out;
++		}
++		delay(10);
++	}
++	if (sdhci_rd32(REG_RESPONSE0) & R1_ERROR_BITS) {
++		error = EIO;
++		ss.data_fail = "write-status";
++		goto out;
++	}
++	sdhci_wr32(REG_INT_STATUS, INT_CMD_COMPLETE);
++
++	/* Transfer Complete comes after the last block's busy (and Auto CMD12's). */
++	nanoseconds_to_absolutetime(SARGO_WR_BUSY_NS + (uint64_t)n * 20000000ull, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		uint32_t st = sdhci_rd32(REG_INT_STATUS);
++		nint = (uint16_t)(st & 0xffff);
++		eint = (uint16_t)(st >> 16);
++		if (eint || (nint & INT_ERROR)) {
++			error = (eint & EINT_DATA_TIMEOUT) ? ETIMEDOUT : EIO;
++			ss.data_fail = "write-data";
++			goto out;
++		}
++		if (nint & INT_XFER_COMPLETE) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			error = ETIMEDOUT;
++			ss.data_fail = "write-xfer-timeout";
++			goto out;
++		}
++		delay(10);
++	}
++	sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
++	error = sargo_wait_programmed();
++	if (!error) {
++		sargo_wr_bytes += bytes;
++		return 0;
+ 	}
++	ss.data_fail = "write-programming";
++out:
++	ss.last_nint = nint;
++	ss.last_eint = eint;
++	if (error) {
++		uint32_t resp[4];
++		printf("SARGO SDHCI: CMD%u lba 0x%llx n %u failed (%s, nint 0x%04x eint 0x%04x adma_err 0x%08x)\n",
++		    idx, lba, n, ss.data_fail ? ss.data_fail : "?", nint, eint, sdhci_rd32(REG_ADMA_ERROR));
++		sdhci_reset_cmd_data();
++		sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
++		if (idx == 25) {
++			/* Stop a multi-block write Auto CMD12 never ended (an error status here is fine). */
++			(void)sdhci_cmd(12, 0, CMD_RESP_SHORT_BUSY | CMD_FLAG_CRC | CMD_FLAG_INDEX, 0, resp);
++		}
++		(void)sargo_wait_programmed();
++	}
+ 	sdhci_wr32(REG_INT_STATUS, 0xffffffffu);
+ 	return error;
+ }
+@@ -997,6 +1191,53 @@
+ 		}
+ 		got = MIN(left, n * SDHCI_BLOCK - skip);
+ 		memcpy(dst + done, sargo_mb_buf + skip, got);
++		done += got;
++	}
++	return 0;
++}
++
++/*
++ * sargo_rw=1: write count bytes at partition byte offset off from src to the
++ * eMMC. Whole sectors go out up to 128 KiB per command; a partial sector is
++ * read first and merged. A failure in fast mode drops to 1-bit 25 MHz and
++ * retries once. Lock held.
++ */
++static int
++sargo_write_range(uint64_t off, uint32_t count, const uint8_t *src)
++{
++	uint32_t done = 0;
++
++	while (done < count) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / SDHCI_BLOCK;
++		uint32_t skip = (uint32_t)(pos % SDHCI_BLOCK);
++		uint32_t left = count - done;
++		uint32_t n, got;
++		int error;
++
++		if (skip != 0 || left < SDHCI_BLOCK) {
++			error = sdhci_read_block(ss.first_block + lba);
++			if (error) {
++				return error;
++			}
++			got = MIN(left, SDHCI_BLOCK - skip);
++			memcpy(sargo_mb_buf, (const uint8_t *)ss.bounce, SDHCI_BLOCK);
++			memcpy(sargo_mb_buf + skip, src + done, got);
++			n = 1;
++		} else {
++			n = sargo_mb_on ? MIN(left / SDHCI_BLOCK, SARGO_MB_MAX_BLOCKS) : 1;
++			got = n * SDHCI_BLOCK;
++			memcpy(sargo_mb_buf, src + done, got);
++		}
++		error = sdhci_write_multi(ss.first_block + lba, n);
++		if (error && sargo_fast) {
++			printf("SARGO SDHCI: write error in fast mode; back to 1-bit 25 MHz\n");
++			sargo_set_safe_mode();
++			error = sdhci_write_multi(ss.first_block + lba, n);
++		}
++		if (error) {
++			return error;
++		}
+ 		done += got;
+ 	}
+ 	return 0;
+@@ -1364,9 +1605,9 @@
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ms);
+ 		ms /= 1000000;
+ 	}
+-	printf("SMP sdhci: %llu req %llu err, mb %d fast %d %u-bit mberr %u, ov %llu MB, %d waiting; %s lba 0x%llx %u B %llu ms\n",
++	printf("SMP sdhci: %llu req %llu err, mb %d fast %d %u-bit mberr %u, %s %llu MB, %d waiting; %s lba 0x%llx %u B %llu ms\n",
+ 	    sargo_io_done, sargo_io_errors, sargo_mb_on, sargo_fast, sargo_bus_width, sargo_mb_errors,
+-	    sargo_ov_bytes >> 20, sargo_io_waiters,
++	    sargo_rw ? "wrote" : "ov", (sargo_rw ? sargo_wr_bytes : sargo_ov_bytes) >> 20, sargo_io_waiters,
+ 	    start == 0 ? "idle" : (sargo_io_write ? "IN WRITE" : "IN READ"),
+ 	    sargo_io_lba, sargo_io_count, ms);
+ }
+@@ -1420,10 +1661,20 @@
+ 	lck_mtx_lock(&sargo_sdhci_lock);
+ 	OSDecrementAtomic(&sargo_io_waiters);
+ 	sargo_io_enter(off, count, is_write);
++	if (is_write && sargo_rw) {
++		error = sargo_write_range(off, count, (const uint8_t *)vaddr);
++		if (!error) {
++			buf_setresid(bp, 0);
++		}
++		sargo_io_leave(error);
++		lck_mtx_unlock(&sargo_sdhci_lock);
++		buf_unmap(bp);
++		goto done;
++	}
+ 	if (is_write) {
+ 		/*
+-		 * Writes go to the RAM overlay (see sargo_ov_get), never to
+-		 * the eMMC. Early launchd remounts the root read-write and
++		 * Without sargo_rw=1, writes go to the RAM overlay (see
++		 * sargo_ov_get), never to the eMMC. Early launchd remounts the root read-write and
+ 		 * flushes, so they must succeed; they used to be dropped.
+ 		 */
+ 		for (uint32_t done = 0; done < count;) {
+@@ -1606,6 +1857,11 @@
+ 	PE_parse_boot_argn("sdhciroot", want, sizeof(want));
+ 	PE_parse_boot_argn("sargo_ovmb", &ovmb, sizeof(ovmb));
+ 	sargo_ov_limit = (uint64_t)ovmb << 20;
++	{
++		uint32_t rw = 0;
++		PE_parse_boot_argn("sargo_rw", &rw, sizeof(rw));
++		sargo_rw = (rw != 0);
++	}
+ 
+ 	ss.regs = ml_io_map(SARGO_SDHCI_BASE, SARGO_SDHCI_SIZE);
+ 	ss.cq_regs = ml_io_map(SARGO_CQHCI_BASE, SARGO_CQHCI_SIZE);
+@@ -1620,6 +1876,13 @@
+ 	if (!error) {
+ 		sargo_speed_up();
+ 	}
++	if (!error && sargo_rw) {
++		/* Write-through: with the eMMC cache off a finished CMD24/25 is on
++		 * the flash. Turning it off flushes it; no cache = switch error. */
++		if (sdhci_switch(EXT_CSD_CACHE_CTRL, 0) == 0) {
++			printf("SARGO SDHCI: eMMC cache off (write-through)\n");
++		}
++	}
+ 	lck_mtx_unlock(&sargo_sdhci_lock);
+ 	if (error) {
+ 		return error;
+@@ -1639,8 +1902,13 @@
+ 	devfs_make_node(ss.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(ss.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+ 	ss.ready = true;
+-	printf("SARGO SDHCI: \"%s\": first block 0x%llx, %llu MiB, eMMC read-only, writes kept in RAM (up to %u MB)\n",
+-	    want, ss.first_block, ss.nblocks * SDHCI_BLOCK >> 20, ovmb);
++	if (sargo_rw) {
++		printf("SARGO SDHCI: \"%s\": first block 0x%llx, %llu MiB, eMMC READ-WRITE (sargo_rw=1)\n",
++		    want, ss.first_block, ss.nblocks * SDHCI_BLOCK >> 20);
++	} else {
++		printf("SARGO SDHCI: \"%s\": first block 0x%llx, %llu MiB, eMMC read-only, writes kept in RAM (up to %u MB)\n",
++		    want, ss.first_block, ss.nblocks * SDHCI_BLOCK >> 20, ovmb);
++	}
+ 	sweet_sample_start();
+ 	/*
+ 	 * USB device mode + live console log (patches 0072-0077, 0081;

@@ -1,0 +1,204 @@
+sargo: sampler shows kernel stacks and the SDHCI driver state
+
+Early boots froze with one process (seputil, mount_hfs, mount) blocked for
+minutes; the sampler only showed its user state (a page fault in dyld).
+Each sampled thread now also gets a "k" line: scheduler state, wait event,
+block hint and the kernel frame-pointer backtrace (unslid), read from the
+thread's saved kernel context as kdp's machine_trace_thread64 does. Each
+sample starts with an "SMP sdhci:" line: request/error counts, read mode,
+overlay size, requests waiting for the lock, and the request inside the
+driver now and for how long. Samples run for an hour (120 x 30 s).
+
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index 43cee47..e7727b1 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -10,7 +10,8 @@
+  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * syscall stub in pc and its caller in lr/bt.
+  *
+- * First sample 30 s after start, then every 30 s, 40 samples at most.
++ * First sample 30 s after start, then every 30 s, 120 samples (1 hour) at most.
++ * Each sample starts with the sargo SDHCI driver's state (patch 0089).
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -23,6 +24,7 @@
+ extern task_t proc_task(proc_t);
+ extern int hz;
+ extern void sweet_sample_start(void);
++extern void sargo_sdhci_dump(void);         /* bsd/dev/sargo_sdhci.c, patch 0089 */
+ 
+ static char sweet_sample_names[256];
+ 
+@@ -75,8 +77,9 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 		return;
+ 	}
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
+-	for (int i = 0; i < 40; i++) {
++	for (int i = 0; i < 120; i++) {
+ 		printf("SMP --- sample %d (%d s)\n", i, (i + 1) * 30);
++		sargo_sdhci_dump();
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+ 		(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
+ 	}
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..f322bb1 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -993,7 +993,14 @@ sweet_crash_strings(const char *name)
+ /*
+  * SWEET process sampler (bsd/dev/sweet_sample.c): user pc/lr/sp and a frame
+  * pointer backtrace of every thread of a task, from the saved user state.
++ * Patch 0089 adds a "k" line per thread: scheduler state (TH_WAIT 1,
++ * TH_RUN 4, TH_UNINT 8), the raw wait event (unslide with kslide from the
++ * header), block hint, and the kernel frame pointer backtrace (unslid;
++ * symbolicate against kernel.development.sweet).
+  */
++#include <kern/thread_kernel_state.h>
++#include <mach/vm_param.h>
++
+ void sweet_sample_task(const char *name, int pid, task_t task);
+ 
+ void
+@@ -1009,7 +1016,8 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		slide = sr->sr_slide;
+ 		vm_shared_region_deallocate(sr);
+ 	}
+-	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
++	printf("SMP %s[%d] slide 0x%llx mh 0x%llx kslide 0x%lx\n", name, pid, slide, task->mach_header_vm_address,
++	    (unsigned long)vm_kernel_slide);
+ 
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+@@ -1036,6 +1044,34 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 			fp = frame[0];
+ 		}
+ 		printf("%s\n", line);
++
++		/* Kernel side: where a blocked thread sleeps (as kdp's machine_trace_thread64). */
++		if (thread != current_thread() && thread->kernel_stack != 0) {
++			vm_offset_t lo = thread->kernel_stack, hi = lo + kernel_stack_size;
++			uint64_t kfp, klr;
++
++			if (thread->machine.kpcb != NULL) {
++				kfp = get_saved_state_fp(thread->machine.kpcb);
++				klr = get_saved_state_lr(thread->machine.kpcb);
++			} else {
++				arm_kernel_saved_state_t *ks = &thread_get_kernel_state(thread)->machine.ss;
++				kfp = ks->fp;
++				klr = ks->lr;
++			}
++			n = snprintf(line, sizeof(line), "SMP %s k%d st 0x%x ev 0x%llx hint %d bt 0x%lx", name, tn - 1,
++			    (unsigned)thread->state, (unsigned long long)thread->wait_event,
++			    (int)thread->block_hint, (unsigned long)VM_KERNEL_UNSLIDE(klr));
++			for (int i = 0; i < 16 && kfp >= lo && kfp + 16 <= hi && (kfp & 7) == 0 &&
++			    n < (int)sizeof(line) - 20; i++) {
++				const uint64_t *kf = (const uint64_t *)kfp;
++				n += snprintf(line + n, sizeof(line) - n, " 0x%lx", (unsigned long)VM_KERNEL_UNSLIDE(kf[1]));
++				if (kf[0] <= kfp) {
++					break;
++				}
++				kfp = kf[0];
++			}
++			printf("%s\n", line);
++		}
+ 	}
+ 	task_unlock(task);
+ }
+--- a/bsd/dev/sargo_sdhci.c
++++ b/bsd/dev/sargo_sdhci.c
+@@ -41,6 +41,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
+ 
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -1337,6 +1338,58 @@
+ sargo_sdhci_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+ {
+ 	return 0;
++}
++
++/*
++ * Diagnostics for the process sampler (patch 0089): one line per sample with
++ * the request counters, the read mode, and whether a request is inside the
++ * driver right now (and for how long) or waiting for the lock. Early boots
++ * froze with one process blocked for minutes (seputil, mount_hfs, mount);
++ * this says whether the driver is involved.
++ */
++static volatile uint64_t sargo_io_start;        /* mach time the current request got the lock; 0 = idle */
++static volatile uint64_t sargo_io_lba;          /* its partition-relative sector */
++static volatile uint32_t sargo_io_count;        /* its byte count */
++static volatile bool sargo_io_write;
++static volatile int32_t sargo_io_waiters;       /* requests waiting for sargo_sdhci_lock */
++static uint64_t sargo_io_done, sargo_io_errors;
++void sargo_sdhci_dump(void);
++
++void
++sargo_sdhci_dump(void)
++{
++	uint64_t start = sargo_io_start, ms = 0;
++
++	if (start != 0) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ms);
++		ms /= 1000000;
++	}
++	printf("SMP sdhci: %llu req %llu err, mb %d fast %d %u-bit mberr %u, ov %llu MB, %d waiting; %s lba 0x%llx %u B %llu ms\n",
++	    sargo_io_done, sargo_io_errors, sargo_mb_on, sargo_fast, sargo_bus_width, sargo_mb_errors,
++	    sargo_ov_bytes >> 20, sargo_io_waiters,
++	    start == 0 ? "idle" : (sargo_io_write ? "IN WRITE" : "IN READ"),
++	    sargo_io_lba, sargo_io_count, ms);
++}
++
++static void
++sargo_io_enter(uint64_t off, uint32_t count, bool is_write)
++{
++	uint64_t now = mach_absolute_time();
++
++	sargo_io_lba = off / SDHCI_BLOCK;
++	sargo_io_count = count;
++	sargo_io_write = is_write;
++	sargo_io_start = now ? now : 1;
++}
++
++static void
++sargo_io_leave(int error)
++{
++	sargo_io_start = 0;
++	sargo_io_done++;
++	if (error) {
++		sargo_io_errors++;
++	}
+ }
+ 
+ static void
+@@ -1363,7 +1416,10 @@
+ 		goto done;
+ 	}
+ 
++	OSIncrementAtomic(&sargo_io_waiters);
+ 	lck_mtx_lock(&sargo_sdhci_lock);
++	OSDecrementAtomic(&sargo_io_waiters);
++	sargo_io_enter(off, count, is_write);
+ 	if (is_write) {
+ 		/*
+ 		 * Writes go to the RAM overlay (see sargo_ov_get), never to
+@@ -1397,6 +1453,7 @@
+ 			done += want;
+ 			buf_setresid(bp, count - done);
+ 		}
++		sargo_io_leave(error);
+ 		lck_mtx_unlock(&sargo_sdhci_lock);
+ 		buf_unmap(bp);
+ 		goto done;
+@@ -1413,6 +1470,7 @@
+ 			printf("SARGO SDHCI: %llu MB read from eMMC\n", sargo_total_bytes_read >> 20);
+ 		}
+ 	}
++	sargo_io_leave(error);
+ 	lck_mtx_unlock(&sargo_sdhci_lock);
+ 	buf_unmap(bp);
+ 

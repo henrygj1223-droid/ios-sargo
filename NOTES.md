@@ -1,5 +1,26 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> UPDATE 2026-11-11 20:27 local: eMMC WRITES WORK, LOCK SCREEN IN ~3.5 MIN <<<
+
+Patch 0090 (commit after d2e2b77, CI run 43142069174): real eMMC writes behind
+boot-arg `sargo_rw=1` (CMD24/CMD25 + Auto CMD12 via the ADMA2 bounce buffer,
+wait for TRAN after each request, EXT_CSD CACHE_CTRL=0 at init). The phone's
+userdata now holds a used iOS root (the pristine image is
+`~/ios-sargo-build/ios16-root.simg`; reflash with `fastboot -S 256M flash
+userdata` if it breaks).
+- 19:47 first rw boot (`out/shim-boot-k43142069174-text-1cpu-rw.img`, 1 CPU,
+  text): no write errors seen, lock screen after ~35 min (LaunchServices
+  reseed, now saved).
+- 20:23 second rw boot (`out/shim-boot-k43142069174-gui-1cpu-rw.img`, same +
+  `sweetfb_noconsole=1`): **lock screen at ~20:26:50, about 3.5 min**.
+Boot-args of the working image: `debug=0xc serial=3 cpus=1 keepsyms=1
+-enable_kprintf_spam -noprogress rd=sdhciroot0 sdhciroot=userdata
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin
+rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetsample=lsd,containermanagerd,
+SpringBoard,launchd,seputil,mount,mount_hfs sargo_rw=1 sweetfb_noconsole=1`.
+Next: buttons (PM660 PON/RESIN + vol-up GPIO), touch (Synaptics S3706 RMI4),
+6 CPUs, colours, the intermittent early freeze.
+
 ## >>> HANDOFF 2026-11-11 19:45 local (Pixel 3a / sargo, read first) <<<
 
 **MILESTONE: iOS 16.7 LOCK SCREEN ON THE PIXEL 3a.** Boot 19:08 local of

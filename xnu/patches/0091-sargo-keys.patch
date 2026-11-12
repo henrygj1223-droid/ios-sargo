@@ -1,0 +1,90 @@
+sargo: power and volume keys
+
+sweet_keys.c (0060) polls PON KPDPWR/RESIN at SID0 0x800 and a volume-up
+GPIO through the SPMI observer, read-only. The Pixel 3a has the same PMIC
+arbiter v5 layout (core 0xc440000, obsrvr 0xe600000, cnfg 0xc40a000) and
+the same PON keys on PM660 SID0 (live FDT qcom,power-on@800: pon_1 KPDPWR
+KEY_POWER, pon_2 RESIN KEY_VOLUMEDOWN). Volume-up is PM660L (SID2) GPIO7,
+active low with pull-up (pinctrl key_vol_up: gpio7) = PPID 0x2c6, where
+sweet's is PM6150L GPIO2 = 0x4c1. Boot-arg sweetkeys_volup=<ppid> picks it
+(default 0x4c1). sargo_sdhci_init() now starts the key thread, as sweet
+does from its UFS root init.
+
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..d995f70 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -113,7 +113,7 @@ keys_thread(void *arg, wait_result_t result)
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
++				printf("SWEET KEYS: key=%d down=%d pon=%#x volup-rt=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+@@ -126,12 +126,18 @@ void
+ sweet_keys_init(void)
+ {
+ 	int enabled = 1;
++	/* SPMI PPID (SID << 8 | peripheral) of the volume-up GPIO: sweet's
++	 * PM6150L GPIO2 is 0x4c1; sargo (Pixel 3a) uses PM660L GPIO7, 0x2c6
++	 * (boot-arg sweetkeys_volup=0x2c6). Power and volume-down are PON
++	 * KPDPWR/RESIN at SID0 0x800 on both. Register offsets are the same. */
++	uint32_t volup_ppid = 0x4c1;
+ 	thread_t thread;
+ 	if (keys_started) {
+ 		return;
+ 	}
+ 	keys_started = true;
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetkeys_volup", &volup_ppid, sizeof(volup_ppid));
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+@@ -152,21 +158,21 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_gpio_apid = keys_find_apid((uint16_t)volup_ppid, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+ 	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+ 	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+ 	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u volup-ppid=%#x apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	    keys_version, count, keys_pon_apid, volup_ppid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: volume-up GPIO not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
+--- a/bsd/dev/sargo_sdhci.c
++++ b/bsd/dev/sargo_sdhci.c
+@@ -48,6 +48,7 @@
+ extern addr64_t kvtophys(vm_offset_t va);
+ extern void sweet_sample_start(void);
+ extern void sweet_usb_probe(void);       /* bsd/dev/sweet_usb.c */
++extern void sweet_keys_init(void);       /* bsd/dev/sweet_keys.c */
+ 
+ /* SDHCI standard register offsets (SD Host Controller spec). */
+ #define REG_DMA_ADDR        0x00
+@@ -1910,6 +1911,9 @@
+ 		    want, ss.first_block, ss.nblocks * SDHCI_BLOCK >> 20, ovmb);
+ 	}
+ 	sweet_sample_start();
++	/* Power / volume keys (patch 0060, sargo PPIDs in 0091). sweet starts
++	 * them from its UFS root init, which sargo does not run. */
++	sweet_keys_init();
+ 	/*
+ 	 * USB device mode + live console log (patches 0072-0077, 0081;
+ 	 * boot-arg sweetusb=2). sweet starts it from its UFS root init, which

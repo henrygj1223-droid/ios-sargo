@@ -1,5 +1,53 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> HANDOFF 2026-11-11 22:00 local (read first) <<<
+
+**Phone state:** `boot_b` (active slot) holds the iOS shim image
+`out/flashed-boot_b.img` = `out/shim-boot-k43148603789-gui-1cpu-rw-keys.img`
+(flashed 20:48). LineageOS boot_b backup: `~/Pixel3a-backup/partitions/boot_b.img`
+(SHA256SUMS verified) and `/Volumes/iOSPort/backup/boot_b.img`.
+userdata = used iOS root written by `sargo_rw=1` boots.
+
+**OPEN BLOCKER (since ~21:45):** every boot falls back to the fastboot screen
+~12-16 s after `fastboot boot`, with ANY kernel (also the pre-touch keys kernel
+k43148603789) and also after a full power-off (fastboot menu -> Power off).
+What the screen shows in those seconds is NOT captured yet. Suspect the iOS
+root on userdata (forced power-offs during early-freeze boots with rw on) or a
+write-path bug; not verified. Next: film `out/shim-boot-k43142069174-text-1cpu-rw.img`
+(text, rw, no touch) to see the last lines. If the HFS root is broken, reflash
+`fastboot -S 256M flash userdata ~/ios-sargo-build/ios16-root.simg` (~7 min)
+and redo the ~35 min first rw boot.
+
+**Early freezes** (about 1 in 3 boots, any core count, seen only with fast
+reads so far): a very early process (seputil pid 4, mount_hfs pid 3, mount
+pid 2/7) stops at the SAME instruction in dyld-in-cache
+(`lsl::PersistentAllocator` ctor +0x40); 0089's `SMP sdhci:` line shows the
+driver idle with 0 errors, and the thread has no kernel stack (continuation
+wait). Hypothesis: the process raises an exception, the exception message
+goes to launchd, and launchd is blocked in wait4() on that same process.
+Built-in logging is on in the `*-exc` images: boot-arg
+`exception_log_max_pid=60` prints `[System Event] ... sending exception N
+(code0 code1)` (record_system_event -> printf).
+
+**Touch (0092, CI 43151756585):** new `bsd/dev/sargo_touch.c`, Synaptics RMI4
+at 0x20 on SE9 0xa84000 (same GENI engine/pins as sweet_touch), reset TLMM 99,
+IRQ 125, switch 135 low, power PM660 GPIO12 via SPMI write channel; boot-args
+`sweettouch_panel_h=2220` (SweetHIDTouch panel height), `sargotouchdelay`.
+NOT TESTED: both touch boots froze early (before the 20 s start).
+Images: `out/shim-boot-k43151756585-{text,gui}-1cpu-touch.img`,
+`-gui-1cpu-exc.img`, `-gui-6cpu-30hz-exc.img` (frame-rate test: cpus=6,
+sweetfb_hz=30).
+
+**Buttons (0091):** work (power reached iOS, long-press -> Siri because the
+1-CPU system is slow). Boot-arg `sweetkeys_volup=0x2c6`.
+
+**Tools:** `tools/sargo-kcheck.py LOG BUILDTREE TEMPLATE FILE...` syntax-checks
+kernel sources locally with the CI flags (download the `xnu-buildtree` artifact,
+use a CI log for the template command; Apple clang from the CLT works);
+`tools/sargo-dsc-sym.py CACHE_DIR SLIDE ADDR...` symbolicates user addresses in
+the split shared cache (mount the iOS image read-only with hdiutil
+`-imagekey diskimage-class=CRawDiskImage`).
+
 ## >>> UPDATE 2026-11-11 20:27 local: eMMC WRITES WORK, LOCK SCREEN IN ~3.5 MIN <<<
 
 Patch 0090 (commit after d2e2b77, CI run 43142069174): real eMMC writes behind

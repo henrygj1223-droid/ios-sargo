@@ -1,5 +1,53 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> HANDOFF 2026-11-11 19:45 local (Pixel 3a / sargo, read first) <<<
+
+**MILESTONE: iOS 16.7 LOCK SCREEN ON THE PIXEL 3a.** Boot 19:08 local of
+`out/shim-boot-k43138011583-text-1cpu.img` = kernel CI run 43138011583
+(branch `usb-live-log`, patches through 0089, commit 00aeb11) +
+`out/sargo.adt`. Boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1
+-enable_kprintf_spam -noprogress rd=sdhciroot0 sdhciroot=userdata
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin
+rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetsample=launchd,seputil,mount,
+mount_hfs,containermanagerd,cryptexd,keybagd,SpringBoard,backboardd
+sargo_ovmb=1024` (text console on). Lock screen ("Wednesday, December 31
+4:34" = 34 min after the epoch in PST) with the camera button; clock drawn in
+red (colour channels may be swapped - unverified). Touch/buttons: no sargo
+drivers yet.
+
+What got it there (observed): 0086 RAM write overlay (no more stale-read
+panic at ~36 min), 0087 fast reads (CMD18, 8-bit, 52 MHz), overlay cap 1 GB
+(`sargo_ovmb=1024`), 1 CPU. For most of the boot SpringBoard's main thread
+and backboardd wait in `_LSCopyServerStore`
+(`__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__`): LaunchServices
+rebuilds its database on EVERY boot because nothing is written to the eMMC.
+
+Open problems:
+1. **Intermittent early freeze** (3 of ~10 fast-read boots; none yet with
+   `sargo_mb=0`, few samples): one early process blocked for minutes in a
+   page fault at its start - seputil (pid 4), mount_hfs (pid 3), mount
+   (pid 7, user pc in dyld `lsl::PersistentAllocator` ctor). 0089 prints
+   kernel stacks (`SMP name kN st .. ev .. hint .. bt ..`, unslid, kslide 0)
+   and an `SMP sdhci:` driver line per sample to catch the next one.
+2. **cpus=6**: boots fast (1.5 GB read in ~3 min) but backboardd never
+   presents a frame. Unexplained. A 6-core run with the old 256 MB overlay
+   had containermanagerd crash looping ("Failed to initialize database",
+   `+[MCMSQLiteDB openDBWithURL:error:]`) and cryptexd `mkdirat` EINVAL -
+   consistent with the overlay filling and the HFS journal going invalid
+   (journal_start_transaction returns EINVAL); not verified.
+3. **USB live log** (0088 calls sweet_usb_probe from sargo_sdhci_init;
+   `sweetusb=2`): the phone never enumerated on the Mac. The `SWEET USB:`
+   probe lines have not been captured yet (GCC CBCR offsets in sweet_usb.c
+   are SM7150's; SDM670 differs, see gcc-sdm845.c).
+
+Next: write to the eMMC for real (so the reseed happens once), then touch
+(Synaptics S3706 RMI4) and buttons (PM660).
+
+Tools added: `tools/mkiosroot-macos.sh` (root image on macOS),
+`tools/sargo-usblog-mac.py` + `tools/sargo-usbnet-mac.sh` (USB log host side).
+Symbolicate user addresses with the shared cache from the image (scratch
+script dsc_sym.py in the 2026-11-11 session; slide = the sampler's `slide`).
+
 ## >>> CURRENT BLOCKER: SDHCI CMD0 TIMEOUT, 2026-11-06 18:47 (Pepper, read first) <<<
 
 **CORRECTION — the zone_init stall below is SUPERSEDED and wrong.** The kernel

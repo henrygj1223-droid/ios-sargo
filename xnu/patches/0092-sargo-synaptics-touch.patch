@@ -1,0 +1,1015 @@
+sargo: Synaptics RMI4 touchscreen
+
+The Pixel 3a touch IC is a Synaptics DSX (RMI4) at I2C 0x20 on QUPv3 SE9
+(dtbo S4 PVT: synaptics_dsx@20 on qupv3_se9_i2c). SE9 is at 0xa84000, the
+same GENI engine, clocks (wrap1 s1, RCG 0x18148) and SDA/SCL pins (GPIO6/7
+function 1) that sweet_touch.c drives, so its I2C code is reused in the new
+bsd/dev/sargo_touch.c. New pieces: reset TLMM GPIO99, IRQ GPIO125, bus
+switch GPIO135 low (AP, not SSC), touch power PM660 GPIO12 output high
+through the SPMI arbiter v5 write channel (only if the APID is APPS-owned
+and the pin is not already on), I2C at 400 kHz, and RMI4 after Linux
+drivers/input/rmi4: PDT scan, F01 configured/no-doze, F12 register
+descriptors, control 8 max x/y, data1 objects. Polled every 8 ms while
+touched or the IRQ line is low, else every ~100 ms; reports panel pixels
+to SweetHIDTouch. SweetHIDTouch takes the panel height from boot-arg
+sweettouch_panel_h (sweet 2400 by default, sargo 2220) instead of a fixed
+1080x2400, so the edge-swipe zone and the mapping into the presented
+1125x2436 display match the 1080x2220 panel. Boot-args: sargotouch=0,
+sargotouchdelay=<s> (default 20).
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1d77ebf..4078340 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sargo_sdhci.c			standard
++bsd/dev/sargo_touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sargo_touch.c b/bsd/dev/sargo_touch.c
+new file mode 100644
+index 0000000..9313ad2
+--- /dev/null
++++ b/bsd/dev/sargo_touch.c
+@@ -0,0 +1,899 @@
++/*
++ * sargo (Pixel 3a) touch: Synaptics DSX (RMI4) at I2C 0x20 on QUPv3 SE9.
++ *
++ * Wiring from the phone's dtbo (S4 PVT, synaptics_dsx@20 on qupv3_se9_i2c):
++ *   SE9 0x0a84000, SDA/SCL TLMM GPIO6/7 function 1 (qup9), 19.2 MHz XO;
++ *   reset TLMM GPIO99 (active low), IRQ TLMM GPIO125 (active low),
++ *   bus switch TLMM GPIO135 (low = AP, high = SSC), touch power PM660
++ *   (SPMI SID0) GPIO12 output high; display-coords 1080x2220.
++ * The GENI I2C engine, its clocks and the TLMM layout are the same as on
++ * sweet (sweet_touch.c, which drives the same SE at the same address), so
++ * that code is reused here. New: one PMIC GPIO set through the SPMI arbiter
++ * write channel, and the RMI4 protocol (PDT scan, F01 device control, F12
++ * register descriptors, F12 data1 objects), following Linux drivers/input/
++ * rmi4. Coordinates go to SweetHIDTouch in panel pixels (sweettouch_panel_h).
++ *
++ * Boot-args: sargotouch=0 (off), sargotouchdelay=<s> (default 20).
++ * Polled: every 8 ms while a finger is down or the IRQ line is low, else
++ * every ~100 ms.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sargo_touch_init(void);
++
++#define ST_SE_PA         0x00a84000u
++#define ST_GCC_PA        0x00100000u
++#define ST_NORTH_PA      0x03900000u     /* TLMM 0x3400000 + NORTH 0x500000 */
++#define ST_WEST_PA       0x03500000u     /* TLMM 0x3400000 + WEST 0x100000 */
++#define ST_GCC_VOTE      0x5200cu
++#define ST_RCG           0x18148u        /* gcc_qupv3_wrap1_s1_clk_src = SE9 */
++#define ST_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
++#define ST_GPIO_IO(n)    (ST_GPIO_CFG(n) + 4u)
++#define ST_PIN_SDA       6u
++#define ST_PIN_SCL       7u
++#define ST_PIN_RESET     99u
++#define ST_PIN_IRQ       125u
++#define ST_PIN_SWITCH    135u
++#define ST_ADDR          0x20u
++#define ST_MAX           10u
++
++/* SPMI PMIC arbiter v5 (same block as sweet): observer reads, RW channel writes. */
++#define SP_CORE_PA       0x0c440000u
++#define SP_CNFG_PA       0x0c40a000u
++#define SP_OBS_PA        0x0e600000u
++#define SP_CHNLS_PA      0x0c600000u
++#define SP_NO_APID       0xffffu
++#define PM_GPIO12_PPID   0x0cbu          /* PM660 SID0, GPIO12 at 0xcb00 */
++
++/* GENI SE registers (sweet_touch.c). */
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++	                 (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++/* RMI4 */
++#define RMI_PAGE_SELECT  0xffu
++#define RMI_PDT_START    0xe9u
++#define RMI_PDT_END      0x05u
++#define RMI_MAX_PAGE     4u
++#define RMI_DESC_BITS    (35u * 8u)
++#define RMI_DESC_ITEMS   32u
++
++struct st_desc_item {
++	uint16_t reg;
++	uint16_t size;
++	uint32_t subpackets;            /* first 32 subpacket bits */
++};
++
++struct st_desc {
++	unsigned count;
++	struct st_desc_item item[RMI_DESC_ITEMS];
++};
++
++static struct {
++	vm_offset_t se, gcc, north, west;
++	vm_offset_t sp_core, sp_cnfg, sp_obs;
++	bool started, dead;
++	uint32_t irq_status, irq_last, active;
++	unsigned sent, got;
++	int page;
++	int x[ST_MAX], y[ST_MAX];
++	/* RMI4 */
++	uint16_t f01_query, f01_ctrl, f01_data;
++	uint16_t f12_query, f12_ctrl, f12_data;
++	unsigned f12_irq_pos, irq_count;
++	bool have_f01, have_f12, have_f34;
++	struct st_desc qdesc, cdesc, ddesc;
++	unsigned data1_off, fingers, read_len;
++	int max_x, max_y, panel_w, panel_h;
++} st;
++static int st_sleep_chan;
++
++static uint32_t
++st_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++st_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++st_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&st_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++st_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(st_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM pin: pull 0 none / 3 up, drive = (mA / 2) - 1. */
++static void
++st_gpio(vm_offset_t tile, unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	uint32_t off = ST_GPIO_CFG(pin);
++	uint32_t cfg = st_rd(tile, off);
++	if (out) {
++		st_wr(tile, ST_GPIO_IO(pin), (st_rd(tile, ST_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	st_wr(tile, off, cfg);
++}
++
++/* ---- SPMI: one PMIC GPIO ---- */
++
++static uint16_t
++sp_find_apid(unsigned ppid, unsigned *owner)
++{
++	uint32_t count = st_rd(st.sp_core, 4) & 0x7ffu;
++	uint16_t found = SP_NO_APID;
++	for (uint32_t i = 0; i < count && i < 512; ++i) {
++		uint32_t map = st_rd(st.sp_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		unsigned own = st_rd(st.sp_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == SP_NO_APID || own == 0) {
++			found = (uint16_t)i;
++			*owner = own;
++		}
++	}
++	return found;
++}
++
++static bool
++sp_read(uint16_t apid, uint8_t reg, uint8_t *out)
++{
++	uint32_t off = 0x80u * apid;
++	st_wr(st.sp_obs, off, (1u << 27) | ((uint32_t)reg << 4));     /* EXT_READL, 1 byte */
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = st_rd(st.sp_obs, off + 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)st_rd(st.sp_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++sp_write(vm_offset_t ch, uint8_t reg, uint8_t val)
++{
++	st_wr(ch, 0x10u, val);                                          /* WDATA0 */
++	st_wr(ch, 0x00u, (0u << 27) | ((uint32_t)reg << 4));            /* EXT_WRITEL, 1 byte */
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = st_rd(ch, 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				printf("SARGO TOUCH: PMIC write %#x=%#x status %#x\n", reg, val, status);
++				return false;
++			}
++			return true;
++		}
++		delay(1);
++	}
++	printf("SARGO TOUCH: PMIC write %#x=%#x timed out\n", reg, val);
++	return false;
++}
++
++/* PM660 GPIO12 -> output high, as the dtbo's touch_power_default. */
++static bool
++st_power_on(void)
++{
++	unsigned owner = 7;
++	uint8_t subtype = 0, mode = 0, src = 0, en = 0;
++
++	st.sp_core = ml_io_map(SP_CORE_PA, 0x2000);
++	st.sp_cnfg = ml_io_map(SP_CNFG_PA, 0x1000);
++	st.sp_obs = ml_io_map(SP_OBS_PA, 0x10000);
++	if (!st.sp_core || !st.sp_cnfg || !st.sp_obs) {
++		printf("SARGO TOUCH: SPMI mapping failed\n");
++		return false;
++	}
++	uint32_t ver = st_rd(st.sp_core, 0);
++	if (ver < 0x50000000u || ver >= 0x70000000u) {
++		printf("SARGO TOUCH: unsupported SPMI arbiter %#x\n", ver);
++		return false;
++	}
++	uint16_t apid = sp_find_apid(PM_GPIO12_PPID, &owner);
++	if (apid == SP_NO_APID) {
++		printf("SARGO TOUCH: PM660 GPIO12 not mapped in the SPMI arbiter\n");
++		return false;
++	}
++	bool ok = sp_read(apid, 0x05, &subtype) && sp_read(apid, 0x40, &mode) &&
++	    sp_read(apid, 0x44, &src) && sp_read(apid, 0x46, &en);
++	bool lvmv = subtype >= 0x10 && subtype <= 0x13;
++	printf("SARGO TOUCH: PM660 GPIO12 apid %u owner %u subtype %#x mode %#x src %#x en %#x (read %d)\n",
++	    apid, owner, subtype, mode, src, en, ok);
++	if (!ok) {
++		return false;
++	}
++	bool is_out_high = lvmv ? ((mode & 3u) == 1u && (src & 0x80u)) :
++	    (((mode >> 4) & 7u) == 1u && (mode & 1u));
++	if ((en & 0x80u) && is_out_high) {
++		printf("SARGO TOUCH: touch power already on\n");
++		return true;
++	}
++	if (owner != 0) {
++		printf("SARGO TOUCH: GPIO12 owned by EE %u, not APPS; cannot switch touch power\n", owner);
++		return false;
++	}
++	vm_offset_t ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++	if (!ch) {
++		return false;
++	}
++	ok = sp_write(ch, 0x41, 0x00) &&                /* DIG_VIN: VIN0 (power-source 0) */
++	    sp_write(ch, 0x42, 0x05) &&                 /* DIG_PULL: disabled */
++	    sp_write(ch, 0x45, 0x02) &&                 /* DIG_OUT: CMOS, medium strength */
++	    sp_write(ch, 0x43, 0x00);                   /* DIG_IN: no dtest */
++	if (ok && lvmv) {
++		ok = sp_write(ch, 0x40, 0x01) &&        /* MODE: digital output */
++		    sp_write(ch, 0x44, 0x80);           /* OUT_SOURCE: normal, inverted = high */
++	} else if (ok) {
++		ok = sp_write(ch, 0x40, (1u << 4) | 1u);        /* output, function normal, high */
++	}
++	ok = ok && sp_write(ch, 0x46, 0x80);            /* EN */
++	(void)sp_read(apid, 0x40, &mode);
++	(void)sp_read(apid, 0x44, &src);
++	(void)sp_read(apid, 0x46, &en);
++	printf("SARGO TOUCH: touch power %s (mode %#x src %#x en %#x)\n", ok ? "on" : "FAILED", mode, src, en);
++	return ok;
++}
++
++/* ---- GENI SE9 I2C (sweet_touch.c) ---- */
++
++static bool
++st_clocks(void)
++{
++	uint32_t mask = (0x0fu << 18) | (1u << 23);    /* wrapper1 core/ahb + SE9 (wrap1 s1) */
++	st_wr(st.gcc, ST_GCC_VOTE, st_rd(st.gcc, ST_GCC_VOTE) | mask);
++	uint32_t dfs = st_rd(st.gcc, ST_RCG + 0x14u);
++	uint32_t cfg = st_rd(st.gcc, ST_RCG + 4u);
++	printf("SARGO TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    st_rd(st.gcc, ST_GCC_VOTE), st_rd(st.gcc, ST_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		cfg = st_rd(st.gcc, ST_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SARGO TOUCH: DFS level0=%#x is not XO/1\n", cfg);
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;    /* XO, divider 1 */
++		st_wr(st.gcc, ST_RCG + 4u, cfg);
++		st_wr(st.gcc, ST_RCG, st_rd(st.gcc, ST_RCG) | 1u);
++		if (!st_wait_clear(st.gcc, ST_RCG, 1u)) {
++			printf("SARGO TOUCH: RCG update timeout\n");
++			return false;
++		}
++	}
++	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!st_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			printf("SARGO TOUCH: GCC branch %#x halted (%#x)\n", branches[i], st_rd(st.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++st_abort(void)
++{
++	st_wr(st.se, SE_CTRL, 2);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (st_rd(st.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !st_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		printf("SARGO TOUCH: abort failed status=%#x irq=%#x; stopping\n",
++		    st_rd(st.se, SE_STATUS), st_rd(st.se, SE_IRQ));
++	}
++	for (unsigned i = 0; i < 64 && (st_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)st_rd(st.se, SE_RX);
++	}
++	st_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	if (st_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
++		st.dead = true;
++		printf("SARGO TOUCH: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++static uint32_t
++st_irq(void)
++{
++	st.irq_last = st_rd(st.se, SE_IRQ);
++	st.irq_status |= st.irq_last;
++	return st.irq_last;
++}
++
++/* One FIFO message: TX at most 3 bytes, RX at most 90. */
++static int
++st_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!st_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		return EBUSY;
++	}
++	st_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	st_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
++	st_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	st_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = st_irq();
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = st_irq();
++			}
++			if ((irq & SE_DONE) && !(st_rd(st.se, SE_STATUS) & 1u) &&
++			    !(st_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(st_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				st_wr(st.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			st_wr(st.se, SE_TX, word);
++			st.sent = nt;
++			st_wr(st.se, SE_TX_WM, 0);
++		}
++		uint32_t count = st_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = st_rd(st.se, SE_RX);
++			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
++				rx[st.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			irq = st_irq();
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			st_wr(st.se, SE_IRQ_CLR, irq);
++			if (st.got == nr && st.sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		st_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	st_abort();
++	return err;
++}
++
++static int
++st_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	st.irq_status = st.irq_last = 0;
++	st.sent = st.got = 0;
++	return st_msg_run(ST_ADDR, tx, nt, rx, nr, stretch);
++}
++
++static bool
++st_se_init(void)
++{
++	uint32_t fw = st_rd(st.se, SE_FW);
++	uint32_t tx = st_rd(st.se, SE_HW_TX), rx = st_rd(st.se, SE_HW_RX);
++	printf("SARGO TOUCH: se9 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, st_rd(st.se, SE_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 3u || (st_rd(st.se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("SARGO TOUCH: SE9 has no I2C firmware or unexpected FIFOs; stopping\n");
++		return false;
++	}
++	if (st_rd(st.se, SE_STATUS) & 0x1001u) {
++		printf("SARGO TOUCH: SE9 busy; stopping\n");
++		return false;
++	}
++	st_wr(st.se, 0xe18, 0);
++	st_wr(st.se, 0xe1c, 0);
++	st_wr(st.se, 0x644, 0);
++	st_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	st_wr(st.se, 0x648, 0xffffffffu);
++	st_wr(st.se, SE_DMA, 0);
++	st_wr(st.se, 0x28, st_rd(st.se, 0x28) | 0x7fu);
++	st_wr(st.se, 0xe30, st_rd(st.se, 0xe30) | 0x0fu);
++	st_wr(st.se, 0x24, 0x7f);
++	st_wr(st.se, 0x20, 1);
++	st_wr(st.se, SE_CLK_SEL, 0);
++	/* 400 kHz from 19.2 MHz (Linux geni_i2c_clk_map: div 2, high 5, low 12, cycle 24). */
++	st_wr(st.se, SE_MCLK, (2u << 4) | 1u);
++	st_wr(st.se, SE_SCL, (5u << 20) | (12u << 10) | 24u);
++	st_wr(st.se, 0x254, 0);
++	st_wr(st.se, 0x260, SE_PACK0);
++	st_wr(st.se, 0x264, SE_PACK1);
++	st_wr(st.se, 0x284, SE_PACK0);
++	st_wr(st.se, 0x288, SE_PACK1);
++	st_wr(st.se, SE_TX_WM, 0);
++	st_wr(st.se, 0x810, 0);
++	st_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	st_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	if (st_rd(st.se, 0x260) != SE_PACK0 || st_rd(st.se, 0x264) != SE_PACK1 ||
++	    (st_rd(st.se, SE_TX_COUNT) & 0xfffffffu) || (st_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SARGO TOUCH: SE9 setup readback mismatch; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++/* ---- RMI4 over I2C ---- */
++
++static int
++rmi_set_page(unsigned page)
++{
++	if (st.page == (int)page) {
++		return 0;
++	}
++	const uint8_t sel[2] = {RMI_PAGE_SELECT, (uint8_t)page};
++	int err = st_msg(sel, 2, NULL, 0, false);
++	st.page = err ? -1 : (int)page;
++	return err;
++}
++
++static int
++rmi_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	int err = rmi_set_page(addr >> 8);
++	if (err) {
++		return err;
++	}
++	uint8_t ptr = (uint8_t)addr;
++	err = st_msg(&ptr, 1, NULL, 0, true);
++	if (err) {
++		return err;
++	}
++	return st_msg(NULL, 0, buf, len, false);
++}
++
++static int
++rmi_write(uint16_t addr, uint8_t val)
++{
++	int err = rmi_set_page(addr >> 8);
++	if (err) {
++		return err;
++	}
++	const uint8_t w[2] = {(uint8_t)addr, val};
++	return st_msg(w, 2, NULL, 0, false);
++}
++
++/* Linux rmi_read_register_desc(): size, presence, structure; one address each. */
++static int
++rmi_read_desc(uint16_t addr, struct st_desc *d)
++{
++	uint8_t size_presence = 0, presence[35], sbuf[90];
++	unsigned struct_size, poff = 1, map = 0, off = 0, reg;
++	uint8_t bits[RMI_DESC_BITS / 8];
++	int err;
++
++	memset(d, 0, sizeof(*d));
++	memset(presence, 0, sizeof(presence));
++	memset(bits, 0, sizeof(bits));
++	err = rmi_read(addr, &size_presence, 1);
++	if (err || size_presence == 0 || size_presence > 35) {
++		return err ? err : EIO;
++	}
++	err = rmi_read(addr + 1, presence, size_presence);
++	if (err) {
++		return err;
++	}
++	if (presence[0] == 0) {
++		poff = 3;
++		struct_size = presence[1] | ((unsigned)presence[2] << 8);
++	} else {
++		struct_size = presence[0];
++	}
++	for (unsigned i = poff; i < size_presence; i++) {
++		bits[map / 8] = presence[i];
++		map += 8;
++	}
++	if (struct_size == 0 || struct_size > sizeof(sbuf)) {
++		printf("SARGO TOUCH: register structure of %u bytes not supported\n", struct_size);
++		return EIO;
++	}
++	err = rmi_read(addr + 2, sbuf, struct_size);
++	if (err) {
++		return err;
++	}
++	for (reg = 0; reg < map && d->count < RMI_DESC_ITEMS && off < struct_size; reg++) {
++		if (!(bits[reg / 8] & (1u << (reg % 8)))) {
++			continue;
++		}
++		struct st_desc_item *it = &d->item[d->count++];
++		unsigned size = sbuf[off++];
++		if (size == 0 && off + 2 <= struct_size) {
++			size = sbuf[off] | ((unsigned)sbuf[off + 1] << 8);
++			off += 2;
++		}
++		if (size == 0 && off + 4 <= struct_size) {
++			size = sbuf[off] | ((unsigned)sbuf[off + 1] << 8);  /* 32-bit sizes: low 16 bits */
++			off += 4;
++		}
++		it->reg = (uint16_t)reg;
++		it->size = (uint16_t)size;
++		unsigned sp = 0;
++		while (off < struct_size) {
++			uint8_t b = sbuf[off++];
++			for (unsigned k = 0; k < 7; k++, sp++) {
++				if ((b & (1u << k)) && sp < 32) {
++					it->subpackets |= 1u << sp;
++				}
++			}
++			if (!(b & 0x80u)) {
++				break;
++			}
++		}
++	}
++	return 0;
++}
++
++static const struct st_desc_item *
++rmi_desc_item(const struct st_desc *d, unsigned reg, unsigned *index)
++{
++	for (unsigned i = 0; i < d->count; i++) {
++		if (d->item[i].reg == reg) {
++			if (index) {
++				*index = i;
++			}
++			return &d->item[i];
++		}
++	}
++	return NULL;
++}
++
++static int
++rmi_scan(void)
++{
++	unsigned irq_pos = 0;
++	for (unsigned page = 0; page <= RMI_MAX_PAGE; page++) {
++		bool any = false;
++		for (int a = (int)RMI_PDT_START; a >= (int)RMI_PDT_END; a -= 6) {
++			uint8_t e[6];
++			uint16_t addr = (uint16_t)(page * 0x100u + (unsigned)a);
++			int err = rmi_read(addr, e, sizeof(e));
++			if (err) {
++				printf("SARGO TOUCH: PDT read %#x failed %d\n", addr, err);
++				return err;
++			}
++			if (e[5] == 0 || e[5] == 0xff) {
++				break;
++			}
++			any = true;
++			uint16_t base = (uint16_t)(page * 0x100u);
++			unsigned nirq = e[4] & 7u;
++			printf("SARGO TOUCH: F%02x v%u query %#x ctrl %#x data %#x irqs %u@%u\n",
++			    e[5], (e[4] >> 5) & 3u, base + e[0], base + e[2], base + e[3], nirq, irq_pos);
++			if (e[5] == 0x01) {
++				st.have_f01 = true;
++				st.f01_query = base + e[0];
++				st.f01_ctrl = base + e[2];
++				st.f01_data = base + e[3];
++			} else if (e[5] == 0x12) {
++				st.have_f12 = true;
++				st.f12_query = base + e[0];
++				st.f12_ctrl = base + e[2];
++				st.f12_data = base + e[3];
++				st.f12_irq_pos = irq_pos;
++			} else if (e[5] == 0x34) {
++				st.have_f34 = true;
++			}
++			irq_pos += nirq;
++		}
++		if (!any) {
++			break;
++		}
++	}
++	st.irq_count = irq_pos;
++	return 0;
++}
++
++static bool
++rmi_setup(void)
++{
++	uint8_t status = 0, ctrl0 = 0, q0 = 0, c8[32];
++	unsigned idx = 0;
++
++	st.page = -1;
++	if (rmi_scan() || !st.have_f01) {
++		printf("SARGO TOUCH: no RMI4 F01 found; stopping\n");
++		return false;
++	}
++	if (rmi_read(st.f01_data, &status, 1)) {
++		return false;
++	}
++	printf("SARGO TOUCH: F01 status %#x%s%s\n", status,
++	    (status & 0x40u) ? " BOOTLOADER" : "", (status & 0x80u) ? " unconfigured" : "");
++	if ((status & 0x40u) || !st.have_f12) {
++		printf("SARGO TOUCH: touch firmware not running (F12 %d); stopping\n", st.have_f12);
++		return false;
++	}
++	/* Configured, normal sleep mode, no doze (the IC answers at once). */
++	if (rmi_read(st.f01_ctrl, &ctrl0, 1) ||
++	    rmi_write(st.f01_ctrl, (uint8_t)((ctrl0 & ~0x03u) | 0x80u | 0x04u))) {
++		return false;
++	}
++	/* Enable the F12 interrupt sources (abs + rel) on top of the firmware's mask. */
++	if (st.irq_count > 0) {
++		unsigned byte = st.f12_irq_pos / 8;
++		uint8_t en = 0;
++		if (!rmi_read(st.f01_ctrl + 1 + byte, &en, 1)) {
++			en |= (uint8_t)(3u << (st.f12_irq_pos % 8));
++			(void)rmi_write(st.f01_ctrl + 1 + byte, en);
++		}
++	}
++	if (rmi_read(st.f12_query, &q0, 1) || !(q0 & 1u)) {
++		printf("SARGO TOUCH: F12 without register descriptors (q0 %#x); stopping\n", q0);
++		return false;
++	}
++	if (rmi_read_desc(st.f12_query + 1, &st.qdesc) ||
++	    rmi_read_desc(st.f12_query + 4, &st.cdesc) ||
++	    rmi_read_desc(st.f12_query + 7, &st.ddesc)) {
++		printf("SARGO TOUCH: F12 register descriptors unreadable; stopping\n");
++		return false;
++	}
++	/* Control 8: sensor tuning, subpacket 0 = max x/y. Packet registers are one address each. */
++	const struct st_desc_item *it = rmi_desc_item(&st.cdesc, 8, &idx);
++	st.max_x = st.max_y = 0;
++	if (it && it->size <= sizeof(c8) && !rmi_read(st.f12_ctrl + idx, c8, it->size) && (it->subpackets & 1u)) {
++		st.max_x = c8[0] | (c8[1] << 8);
++		st.max_y = c8[2] | (c8[3] << 8);
++	}
++	if (st.max_x <= 0 || st.max_y <= 0) {
++		st.max_x = st.panel_w - 1;
++		st.max_y = st.panel_h - 1;
++	}
++	/* Data packet from the data base: data0 (if present) then data1 objects. */
++	const struct st_desc_item *d0 = rmi_desc_item(&st.ddesc, 0, NULL);
++	const struct st_desc_item *d1 = rmi_desc_item(&st.ddesc, 1, NULL);
++	if (!d1) {
++		printf("SARGO TOUCH: F12 has no data1 (objects); stopping\n");
++		return false;
++	}
++	st.data1_off = d0 ? d0->size : 0;
++	st.fingers = 0;
++	for (unsigned b = 0; b < 32; b++) {
++		if (d1->subpackets & (1u << b)) {
++			st.fingers++;
++		}
++	}
++	if (st.fingers == 0) {
++		st.fingers = d1->size / 8u;
++	}
++	if (st.fingers > ST_MAX) {
++		st.fingers = ST_MAX;
++	}
++	while (st.fingers > 0 && st.data1_off + st.fingers * 8u > 90u) {
++		st.fingers--;
++	}
++	st.read_len = st.data1_off + st.fingers * 8u;
++	printf("SARGO TOUCH: F12 max %dx%d, %u objects, data1 at +%u, read %u bytes, irq bit %u\n",
++	    st.max_x, st.max_y, st.fingers, st.data1_off, st.read_len, st.f12_irq_pos);
++	return st.fingers > 0;
++}
++
++static void
++st_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < ST_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++static int
++st_poll(void)
++{
++	uint8_t buf[90], irqs[4];
++	int x[ST_MAX] = {0}, y[ST_MAX] = {0};
++	uint32_t mask = 0;
++
++	/* Reading F01's interrupt status releases the IRQ line. */
++	unsigned nirq = (st.irq_count + 7u) / 8u;
++	if (nirq > sizeof(irqs)) {
++		nirq = sizeof(irqs);
++	}
++	if (nirq && rmi_read(st.f01_data + 1, irqs, nirq)) {
++		return EIO;
++	}
++	int err = rmi_read(st.f12_data, buf, st.read_len);
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < st.fingers; i++) {
++		const uint8_t *o = buf + st.data1_off + i * 8u;
++		/* finger, unclassified, gloved finger, narrow / small object */
++		if (o[0] != 0x01 && o[0] != 0x04 && o[0] != 0x06 && o[0] != 0x07 && o[0] != 0x0d) {
++			continue;
++		}
++		int ox = o[1] | (o[2] << 8), oy = o[3] | (o[4] << 8);
++		x[i] = (int)(((int64_t)ox * (st.panel_w - 1)) / st.max_x);
++		y[i] = (int)(((int64_t)oy * (st.panel_h - 1)) / st.max_y);
++		mask |= 1u << i;
++	}
++	st_report(mask, x, y);
++	return 0;
++}
++
++static void
++st_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20;
++	(void)arg;
++	(void)result;
++
++	st.panel_w = 1080;
++	st.panel_h = 2220;
++	(void)PE_parse_boot_argn("sweettouch_panel_h", &st.panel_h, sizeof(st.panel_h));
++	(void)PE_parse_boot_argn("sargotouchdelay", &delay_s, sizeof(delay_s));
++	printf("SARGO TOUCH: starting in %u s\n", delay_s);
++	st_wait(delay_s * 1000u);
++
++	st.gcc = ml_io_map(ST_GCC_PA, 0x60000);
++	st.north = ml_io_map(ST_NORTH_PA, 0x80000);
++	st.west = ml_io_map(ST_WEST_PA, 0x88000);
++	st.se = ml_io_map(ST_SE_PA, 0x4000);
++	if (!st.gcc || !st.north || !st.west || !st.se) {
++		printf("SARGO TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!st_clocks() || !st_se_init()) {
++		goto out;
++	}
++	printf("SARGO TOUCH: TLMM reset=%#x irq=%#x switch=%#x\n",
++	    st_rd(st.north, ST_GPIO_IO(ST_PIN_RESET)), st_rd(st.north, ST_GPIO_IO(ST_PIN_IRQ)),
++	    st_rd(st.west, ST_GPIO_IO(ST_PIN_SWITCH)));
++	st_gpio(st.west, ST_PIN_SWITCH, 0, 0, 0, true, false);         /* bus to the AP */
++	st_gpio(st.north, ST_PIN_IRQ, 0, 0, 0, false, false);          /* input, no pull */
++	st_gpio(st.north, ST_PIN_RESET, 0, 0, 0, true, false);         /* hold reset */
++	if (!st_power_on()) {
++		goto out;
++	}
++	st_wait(20);
++	st_gpio(st.north, ST_PIN_SDA, 1, 0, 0, false, false);          /* qup9 SDA/SCL, 2 mA */
++	st_gpio(st.north, ST_PIN_SCL, 1, 0, 0, false, false);
++	st_wait(2);
++	st_gpio(st.north, ST_PIN_RESET, 0, 0, 0, true, true);          /* release reset */
++	st_wait(300);                                                    /* dtbo reset-delay 20 ms, firmware start */
++	if (!rmi_setup()) {
++		goto out;
++	}
++
++	unsigned errors = 0, idle = 0;
++	while (!st.dead) {
++		bool irq_low = !(st_rd(st.north, ST_GPIO_IO(ST_PIN_IRQ)) & 1u);
++		if (irq_low || st.active || ++idle >= 12) {
++			idle = 0;
++			int err = st_poll();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("SARGO TOUCH: read error %d irq=%#x\n", err, st.irq_status);
++				}
++				if (errors == 10) {
++					st_report(0, st.x, st.y);
++				}
++				st.page = -1;
++			} else {
++				errors = 0;
++			}
++		}
++		st_wait(8);
++	}
++	st_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sargo_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("sargotouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SARGO TOUCH: disabled (sargotouch=0)\n");
++		return;
++	}
++	if (kernel_thread_start(st_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SARGO TOUCH: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..b5697c1 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -368,6 +368,7 @@ protected:
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fPanelW, fPanelH;            /* touch coordinates = panel pixels */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -434,10 +435,21 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/*
++	 * Panel size in pixels: sweet 1080x2400, sargo (Pixel 3a) 1080x2220
++	 * (boot-arg sweettouch_panel_h=2220, patch 0092). The panel sits
++	 * centered in the presented iPhone X display, as in SweetFramebuffer.
++	 */
++	fPanelW = 1080;
++	fPanelH = 2400;
++	PE_parse_boot_argn("sweettouch_panel_h", &fPanelH, sizeof(fPanelH));
++	if (fPanelH < 1000 || fPanelH > 2436) {
++		fPanelH = 2400;
++	}
++	fLogicalW = native ? fPanelW : 1125;
++	fLogicalH = native ? fPanelH : 2436;
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,8 +470,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -472,8 +484,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+--- a/bsd/dev/sargo_sdhci.c
++++ b/bsd/dev/sargo_sdhci.c
+@@ -49,6 +49,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_usb_probe(void);       /* bsd/dev/sweet_usb.c */
+ extern void sweet_keys_init(void);       /* bsd/dev/sweet_keys.c */
++extern void sargo_touch_init(void);      /* bsd/dev/sargo_touch.c */
+ 
+ /* SDHCI standard register offsets (SD Host Controller spec). */
+ #define REG_DMA_ADDR        0x00
+@@ -1914,6 +1915,8 @@
+ 	/* Power / volume keys (patch 0060, sargo PPIDs in 0091). sweet starts
+ 	 * them from its UFS root init, which sargo does not run. */
+ 	sweet_keys_init();
++	/* Synaptics touch on SE9 (patch 0092); its thread waits sargotouchdelay s. */
++	sargo_touch_init();
+ 	/*
+ 	 * USB device mode + live console log (patches 0072-0077, 0081;
+ 	 * boot-arg sweetusb=2). sweet starts it from its UFS root init, which
